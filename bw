@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+bw.sess || exit 1
+
+export BW_SESSION="$(cat $(bw.kf))"
+
+bw.bin "$@"
