@@ -8,4 +8,4 @@ fi
 
 itemID="${1}"; shift
 
-bw get item "${itemID}" | jq -r ".login.password"
+bw get password "${itemID}"
