@@ -4,28 +4,30 @@ A suite of Bash utilities designed to extend the Bitwarden CLI (`bw`). While the
 
 ## Features
 
-* **Secure Session Management:** Handles `bw unlock` and stores session keys in a `tmpfs` RAM-disk (`/run/user/`). Includes a background auto-lock timer that wipes keys after 15 minutes of inactivity.
-* **Deep Item Integration:** Scripts to quickly grab passwords, custom fields, and attachment IDs without writing complex `jq` filters manually.
+* **Kernel-Level Session Management:** Uses the Linux Kernel Keyring (`keyctl`) to store session keys. This keeps secrets out of the filesystem (even RAM-disks) and protects them within kernel memory.
+* **Persistent & Shared Sessions:** Leverages the `@u` (user) keyring to allow a single Bitwarden unlock to persist across multiple terminal windows, tmux panes, and SSH sessions.
+* **Sliding Auto-Lock:** Implements a 15-minute "sliding window" timeout. The kernel automatically purges the session key after 15 minutes of inactivity, but every use of the `bw` wrapper resets the timer.
 * **"Just-in-Time" SSH Keys:** Fetches private keys from Bitwarden attachments and injects them into `ssh-agent` with a 15-second TTL—no keys are ever stored on the local disk.
-* **Automated Server Provisioning:** `bw.keysetup` automates server hardening, creates "jumper" users, and handles Yescrypt password hashing.
-* **Secure Password Piping:** Uses Unix FIFOs to pipe secrets to `SSH_ASKPASS`, ensuring passwords never appear in process lists or shell history.
+* **Automated Server Provisioning:** `bw.keysetup` automates server hardening (PermitRootLogin), creates "jumper" users, and manages per-host SSH keys and password salts.
+* **Injection-Safe Remote Execution:** Uses quoted Heredocs for remote SSH commands to prevent shell interpolation and injection attacks.
 
 ## Prerequisites
 
 1.  **Bitwarden CLI:** Installed on your local machine.
 2.  **Binary Alias:** These scripts expect the Bitwarden CLI binary to be available as `bw.bin`.
-    * *Setup:* `sudo ln -s $(which bw) /usr/local/bin/bw.bin`
-3.  **`jq`:** Required for JSON processing.
-4.  **`perl`:** Used for Yescrypt password hashing in `bw.keysetup`.
+    * *Setup:* `cd "$(dirname "$(which bw)")"; mv bw bw.bin`
+3.  **`keyutils`:** Provides the `keyctl` command-line tool.
+4.  **`jq`:** Required for JSON processing.
+5.  **`perl`:** Used for Yescrypt password hashing in `bw.keysetup`.
 
 ## Installation
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/yourusername/bw-tools.git](https://github.com/yourusername/bw-tools.git)
-    cd bw-tools
+    git clone [https://github.com/neoautomata/bw_scripts.git](https://github.com/neoautomata/bw_scripts.git)
+    cd bw_scripts
     ```
-2.  Add the directory to your `$PATH` or move the scripts to `/usr/local/bin`.
+2.  Add the directory to your `$PATH` or move the scripts to somewhere in your existing path (e.g. `~/bin`).
 3.  Ensure all scripts are executable:
     ```bash
     chmod +x bw*
@@ -53,11 +55,10 @@ A suite of Bash utilities designed to extend the Bitwarden CLI (`bw`). While the
 
 ## Security Architecture
 
-
-
-1.  **Volatile Session Storage:** Session keys reside in `/run/user/$(id -u)/`, a memory-backed filesystem. They are never written to the HDD/SSD.
-2.  **Auto-Lock Background Loop:** When a session is created, a background process monitors the session file's timestamp. If 15 minutes pass without activity, the script executes `bw lock` and cleans up the RAM directory.
-3.  **Encrypted Transport:** Private keys are piped directly from `bw.bin` to `ssh-add`. By using a 15-second TTL (`-t 15`), the key is automatically purged from your SSH agent shortly after the connection is established.
+1.  **Kernel Keyring Storage:** Session keys are stored in the Linux kernel's retention service. They are not visible in the process list (`ps`), shell history, or the filesystem.
+2.  **Sliding Timeout:** The kernel-managed timeout is reset to 900 seconds (15 minutes) on every call to `bw`. This ensures the vault stays open while you are working but locks automatically when you walk away.
+3.  **Memory-Only SSH Keys:** Private keys are piped from Bitwarden directly into `ssh-add`. By using a 15-second TTL (`-t 15`), the key is automatically purged from your SSH agent memory shortly after connection.
+4.  **Secure Piping:** Uses `echo` pipes instead of Bash "here-strings" (`<<<`) to ensure sensitive data is never written to temporary files during redirection.
 
 ## Usage Examples
 
@@ -78,12 +79,12 @@ bw.item.field $(bw.item.search "Cloudflare") "api_key"
 
 ```bash
 # Automatically pulls the key from Bitwarden
-bw.ssh root@production-server.com
+bw.ssh root@production_server
 ```
 
 ### Provisioning a New Server
 
 ```bash
 # Hardens root, creates a jumper user, and saves everything to Bitwarden
-bw.keysetup root@192.168.1.50
+bw.keysetup root@my_host
 ```
