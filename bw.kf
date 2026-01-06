@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-
-# Output the path to where the BW session key file (if any) is located.
-
-echo "/run/user/$(id -u)/bw_sess/key"
