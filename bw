@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 
-bw.sess || exit 1
+KEY_ID=$(keyctl request user bw_session @u 2>/dev/null)
+if [[ $? -ne 0 ]]; then
+    bw.sess || exit 1
+    KEY_ID=$(keyctl request user bw_session @u)
+fi
 
-BW_SESSION="$(cat "$(bw.kf)")"
+# reset the timer to 15 mins (900s) on every use
+keyctl timeout "$KEY_ID" 900
+
+# 4. Export the session key and run the command
+BW_SESSION=$(keyctl pipe "$KEY_ID")
 export BW_SESSION
 
 bw.bin "$@"

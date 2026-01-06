@@ -1,29 +1,10 @@
 #!/usr/bin/env bash
 
-KEYFILE="$(bw.kf)"
 TIMEOUT=900 # 15 minutes
 
-# Ensure secure permissions for any files created
-umask 077
-
-# Load session if it exists
-if [[ -f "$KEYFILE" ]]; then
-    BW_SESSION=$(cat "$KEYFILE" 2>/dev/null)
-    export BW_SESSION
-fi
-
-# Early exit if already unlocked
-if bw.bin unlock --check >/dev/null 2>&1; then
-    touch "$KEYFILE"
-    exit 0
-fi
-
-# update time if already a session
-# Update timestamp if session is still valid (within 14m 45s)
-if [[ -f "$KEYFILE" ]]; then
-    LAST_TOUCH=$(date -r "$KEYFILE" +%s)
-    if [[ $(date +%s) -lt $(( LAST_TOUCH + TIMEOUT - 15 )) ]]; then
-        touch "$KEYFILE"
+# Check if a valid session already exists in the user keyring
+if KEY_ID=$(keyctl request user bw_session @u 2>/dev/null); then
+    if bw unlock --check >/dev/null 2>&1; then
         exit 0
     fi
 fi
@@ -34,15 +15,18 @@ if ! bw.bin login --check >/dev/null 2>&1; then
 fi
 
 # Unlock and Capture Key
-key=$(bw.bin unlock --raw)
+key="$(bw.bin unlock --raw)"
 if [[ $? -ne 0 ]] || [[ -z "$key" ]]; then
     echo "bw unlock failed" >&2
     exit 2
 fi
 
-mkdir -p "$(dirname "$(bw.kf)")" >&2
-echo "$key" > "$KEYFILE"
-export BW_SESSION="$key"
+# Add the key to the User (@u) keyring so it's shared across all shells
+# 'padd' reads from stdin; we use echo -n to avoid trailing newlines
+KEY_ID="$(echo -n "$key" | keyctl padd user bw_session @u)"
+
+# Set the initial expiration
+keyctl timeout "$KEY_ID" "$TIMEOUT"
 
 # Sync if last sync was > 8 hours ago
 LAST_SYNC=$(date --date="$(bw.bin sync --last)" +%s)
@@ -50,19 +34,5 @@ EIGHT_HOURS_AGO=$(( $(date +%s) - 8*60*60 ))
 if [[ "$LAST_SYNC" -lt "$EIGHT_HOURS_AGO" ]]; then
     bw.bin sync >/dev/null 2>&1 || echo "WARN: bw sync failed" >&2
 fi
-
-# Background Auto-lock
-# Use a subshell that ignores hangups and redirects all output.
-(
-  set -m  >&2 # enable job control to force a new process group
-  (
-    while [[ "$(date +%s)" -lt "$(( $(date -r "$(bw.kf)" +%s) + 15*60))" ]]; do
-      sleep 5 >&2
-    done
-    bw.bin lock >&2
-    rm -rf "$(dirname "$(bw.kf)")" >&2
-    bw.bin sync # can be done while locked
-  ) >/dev/null 2>&1 </dev/null &
-)
 
 exit 0
