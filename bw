@@ -2,6 +2,7 @@
 
 bw.sess || exit 1
 
-export BW_SESSION="$(cat $(bw.kf))"
+BW_SESSION="$(cat "$(bw.kf)")"
+export BW_SESSION
 
 bw.bin "$@"

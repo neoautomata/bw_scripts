@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# Check for required arguments
+if [[ "$#" -lt 2 ]]; then
+  echo "Usage: $0 <itemID> <fieldName>" >&2
+  exit 1
+fi
+
+itemID="${1}"; shift
+name="${1}"; shift
+
+itemJSON="$(bw.item.get "${itemID}" 2>/dev/null)"
+
+if [[ "$?" -ne 0 || -z "$itemJSON" ]]; then
+  echo "Error: Could not retrieve item ${itemID}." >&2
+  exit 1
+fi
+
+cnt="$(jq --arg name "${name}" '[.fields[]? | select(.name==$name)] | length' <<<"${itemJSON}")"
+if [[ "${cnt}" -ne 1 ]]; then
+  echo "Item ${itemID} field ${name} not found: ${cnt} items (need 1)" >&2
+  exit 2
+fi
+
+jq -r --arg name "${name}" '.fields[]? | select(.name==$name) | .value' <<<"${itemJSON}"

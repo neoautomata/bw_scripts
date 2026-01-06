@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+itemID="${1}"; shift
+query="${1}"; shift
+
+bw.item.attachmentID "${itemID}" '.attachments[]? | select(.fileName | startswith($q) and endswith(".pub"))' 'Public key' --arg q "${query}"

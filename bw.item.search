@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+# Check if argument exists
+if [[ -z "${1}" ]]; then
+  echo "Usage: $0 <search>" >&2
+  exit 1
+fi
+
+search="${1}"; shift
+
+itemJSON="$(bw list items --search "${search}")"
+if [[ $? -ne 0 || -z "$itemJSON" ]]; then
+  echo "Error: Could not search for ${search}." >&2
+  exit 1
+fi
+
+cnt="$(jq 'length' <<<"${itemJSON}")"
+if [[ "${cnt}" -ne 1 ]]; then
+  echo "Password entry not found for ${search}: ${cnt} items (need 1)" >&2
+  exit 2
+fi
+
+jq -r '.[0].id' <<<"${itemJSON}" || exit 1

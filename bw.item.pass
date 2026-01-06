@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+# Check if argument exists
+if [[ -z "${1}" ]]; then
+  echo "Usage: $0 <itemID>" >&2
+  exit 1
+fi
+
+itemID="${1}"; shift
+
+bw get item "${itemID}" | jq -r ".login.password"

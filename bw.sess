@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
 KEYFILE="$(bw.kf)"
-KEYDIR="$(dirname "$KEYFILE")"
 TIMEOUT=900 # 15 minutes
 
 # Ensure secure permissions for any files created
@@ -9,7 +8,8 @@ umask 077
 
 # Load session if it exists
 if [[ -f "$KEYFILE" ]]; then
-    export BW_SESSION=$(cat "$KEYFILE" 2>/dev/null)
+    BW_SESSION=$(cat "$KEYFILE" 2>/dev/null)
+    export BW_SESSION
 fi
 
 # Early exit if already unlocked

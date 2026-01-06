@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+# set -x
+
+set -o errexit
+set -o pipefail # Ensure failures in pipes are caught
+
+bw.sess || { echo "bw.sess failed"; exit 1; }
+
+cfg="$(ssh -G "$@")"
+user="$(awk 'tolower($1) == "user" {print $2}' <<<"${cfg}")"
+host="$(awk 'tolower($1) == "host" {print $2}' <<<"${cfg}")"
+full_ssh=("$@")
+unset cfg
+
+if [[ "${user}" != "root" ]]; then
+  echo "Must use root user, got ${user}"
+  exit 1
+fi
+
+function findOrCreateItem() {
+  local user="${1}"; shift
+  local host="${1}"; shift
+  local itemID
+  itemID="$(bw.item.search "${user}@${host}" || echo)"
+
+  if [[ -z "${itemID}" ]]; then
+    echo "Creating new ${user}@${host} item" >&2
+    bw get template item | jq --arg name "${user}@${host}" --arg login "$(bw get template item.login | jq --arg user "${user}" --rawfile password <(bw generate -lun --length 32) '.username=$user | .totp="" | .password=$password')" --arg salt "$(bw generate -lun --length 32)" '.notes="" | .name=$name | .login=$login | .fields=[{ name:"password_salt", value:$salt, type:0}]' | bw encode | bw create item
+    bw sync
+
+    itemID="$(bw.item.search "${user}@${host}")"
+    if [[ -z "${itemID}" ]]; then
+      echo "Failed fetching newly created item" >&2
+      exit 1
+    fi
+  else
+    echo "${user}@${host} item found" >&2
+  fi
+
+  echo -n "$itemID"
+}
+
+function checkPassLen() {
+  local itemID="${1}"; shift
+
+  if [[ "$(bw.item.pass "${itemID}" | tr -d '\n' | wc -c)" -lt 32 ]]; then
+    echo "Updating password to 32 characters"
+    bw.item.get "${itemID}" | jq -r --rawfile password <(bw generate -lun --length 32) '(.login.password)|=$password' | bw encode | bw edit item "${itemID}"
+    bw sync
+  fi
+}
+
+function checkSaltLen() {
+  local itemID="${1}"; shift
+
+  if [[ "$(bw.item.field "${itemID}" "password_salt" | tr -d '\n' | wc -c)" -lt 32 ]]; then
+    echo "Updating password salt to 32 characters"
+    bw.item.get "${itemID}" | jq -r --arg salt "$(bw generate -lun --length 32)" '(.fields[] | select(.name=="password_salt")).value|=$salt' | bw encode | bw edit item "${itemID}"
+    bw sync
+  fi
+}
+
+function checkPass() {
+  local itemID="${1}"; shift
+  local user="${1}"; shift
+
+  prefix="\$y\$j9T\$$(bw.item.field "${itemID}" "password_salt")\$"
+  want="$(bw.item.pass "${itemID}" | perl -e 'my $pass=<STDIN>; chomp($pass); print crypt($pass, $ARGV[0])' -- "${prefix}")"
+  if [[ "${want}" != "${prefix}"* ]]; then
+    echo "Invalid desired ${user} shadow entry: ${want}" >&2
+    exit 1
+  fi
+  have="$(ssh "${full_ssh[@]}" getent shadow "\"${user}\"" | cut -d: -f2)"
+  if [[ "$want" != "$have" ]]; then
+    echo "Updating ${user} password"
+
+    ssh "${full_ssh[@]}" cp /etc/shadow /etc/shadow.backup
+    ssh "${full_ssh[@]}" chpasswd -e <<<"${user}:${want}"
+    ssh "${full_ssh[@]}" pwck -q || {
+      echo "Update failed pwck" 2>&1;
+      ssh "${full_ssh[@]}" mv /etc/shadow.backup /etc/shadow;
+      exit 1;
+    }
+    # TODO: check password works somehow (login?)
+    ssh "${full_ssh[@]}" rm /etc/shadow.backup
+  else
+    echo "${user} password matches"
+  fi
+}
+
+function configSSHKey() {
+  local itemID="${1}"; shift
+  local query="${1}"; shift
+
+  keyID="$(bw.item.privKeyID "${itemID}" "${query}" || true)"
+  if [[ -z "$keyID" ]]; then
+    echo "Creating SSH key"
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d -p "/run/user/$(id -u)/" bw_ssh.XXXXXXXXXX) # Create a temporary directory for the keys
+    trap 'rm -rf "$tmp_dir"' EXIT # ensures the dir is deleted regardless of success or failure
+    chmod 700 "$tmp_dir"
+    local keypath="$tmp_dir/${query}"
+
+    fifo="$tmp_dir/ssh_key"
+    mkfifo -m 600 "$fifo"
+    mkfifo -m 600 "${fifo}.pub"
+
+    ssh-keygen -t ed25519 -C "${query} per-host key" -N "" -f "${keypath}"
+    bw create attachment --itemid "${itemID}" --file "${keypath}.pub"
+    bw create attachment --itemid "${itemID}" --file "${keypath}"
+    bw sync
+  else
+    echo "SSH Key already present"
+    return
+  fi
+
+  ssh-copy-id -i <(bw get attachment "${query}.pub" --itemid "${itemID}" --raw) "${user}@${host}"
+}
+
+function updateSSHDConfig() {
+  local remote_args=("$@")
+  
+  echo "Hardening PermitRootLogin..."
+  
+  # This sed command:
+  # 1. Searches for any line starting with PermitRootLogin (commented or not)
+  # 2. Replaces the WHOLE line with the desired setting
+  # 3. If the line doesn't exist, we append it as a fallback
+  local sed_cmd="
+    grep -q '^#*PermitRootLogin' /etc/ssh/sshd_config && \
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || \
+    echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+  "
+
+  ssh "${remote_args[@]}" "cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak && $sed_cmd"
+  
+  # Validate config before restarting
+  if ssh "${remote_args[@]}" "sshd -t"; then
+    ssh "${remote_args[@]}" "systemctl restart ssh"
+    ssh "${remote_args[@]}" "rm /etc/ssh/sshd_config.bak"
+  else
+    echo "SSH Config validation failed! Reverting..." >&2
+    ssh "${remote_args[@]}" "mv /etc/ssh/sshd_config.bak /etc/ssh/sshd_config"
+    exit 1
+  fi
+}
+
+rootItemID="$(findOrCreateItem "${user}" "${host}")"
+
+checkPassLen "${rootItemID}"
+checkSaltLen "${rootItemID}"
+checkPass "${rootItemID}" "root"
+configSSHKey "${rootItemID}" "root@${host}"
+
+# Fetch/create the jumper item
+jumperItemID="$(findOrCreateItem "jumper" "${host}")"
+checkPassLen "${jumperItemID}"
+checkSaltLen "${jumperItemID}"
+ssh "$@" id jumper || {
+  echo "Creating jumper user";
+  ssh "$@" "useradd -m -c "jumper user" jumper"
+}
+checkPass "${jumperItemID}" "jumper"
+configSSHKey "${jumperItemID}" "jumper@${host}"
+
+updateSSHDConfig "${full_ssh[@]}"

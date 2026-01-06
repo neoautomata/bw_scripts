@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+set -o errexit
+
+bw.sess || { echo "bw.sess failed"; exit 1; }
+
+cfg="$(ssh -G "$@")"
+user="$(awk 'tolower($1) == "user" {print $2}' <<<"${cfg}")"
+host="$(awk 'tolower($1) == "host" {print $2}' <<<"${cfg}")"
+unset cfg
+
+itemID="$(bw.item.search "${user}@${host}")"
+if [[ -z "${itemID}" ]]; then
+  exit 1
+fi
+
+privkeyID="$(bw.item.privKeyID "${itemID}" "${user}@${host}")"
+
+if [[ -z "${privkeyID}" ]]; then
+  echo -e "Using password ..."
+
+  tmp_dir=$(mktemp -d -p "/run/user/$(id -u)/" bw_ssh.XXXXXXXXXX) # Create a temporary directory for the pipe
+  trap 'rm -rf "$tmp_dir"' EXIT # ensures the pipe is deleted regardless of success or failure
+
+  fifo="$tmp_dir/askpass_fifo"
+  mkfifo -m 600 "$fifo"
+
+  # Create the askpass script
+  askpass_script="$tmp_dir/askpass.sh"
+  cat <<EOF > "$askpass_script"
+#!/bin/bash
+cat "$fifo"
+EOF
+  chmod +x "$askpass_script"
+
+  # Fetch password from Bitwarden and feed it into the pipe in the background
+  bw.item.pass "$itemID" > "$fifo" &
+
+  # Execute SSH
+  exec env SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE='force' ssh "$@"
+fi
+
+# add the key with a 15 sec timeout
+bw get attachment "${privkeyID}" --itemid "${itemID}" --raw | ssh-add -t 15 - >/dev/null || { echo "Failed loading private key"; exit 1; }
+exec ssh "$@"

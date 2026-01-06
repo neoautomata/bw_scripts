@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+itemID="${1}"; shift
+query="${1}"; shift
+msg="${1}"; shift
+
+if [[ -z "$itemID" || -z "$query" ]]; then
+  echo "Usage: $0 <itemID> <jq_query> [error_message [addition_jq_args]]" >&2
+  exit 1
+fi
+
+itemJSON="$(bw.item.get "${itemID}")"
+if [[ $? -ne 0 || -z "$itemJSON" ]]; then
+  echo "Error: Could not retrieve item ${itemID}." >&2
+  exit 1
+fi
+
+cnt="$(jq "[${query}] | length" "${@}" <<<"${itemJSON}")"
+if [[ "${cnt}" -ne 1 ]]; then
+  echo "$msg not found: ${cnt} attachments (need 1)" >&2
+  exit 2
+fi
+
+jq -r "${query} | .id" "${@}" <<<"${itemJSON}"
