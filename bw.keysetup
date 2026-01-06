@@ -124,27 +124,28 @@ function updateSSHDConfig() {
   
   echo "Hardening PermitRootLogin..."
   
-  # This sed command:
-  # 1. Searches for any line starting with PermitRootLogin (commented or not)
-  # 2. Replaces the WHOLE line with the desired setting
-  # 3. If the line doesn't exist, we append it as a fallback
-  local sed_cmd="
-    grep -q '^#*PermitRootLogin' /etc/ssh/sshd_config && \
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || \
-    echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
-  "
+  ssh "${remote_args[@]}" /usr/bin/env bash << 'EOF'
+set -e
+CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.bak"
 
-  ssh "${remote_args[@]}" "cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak && $sed_cmd"
-  
-  # Validate config before restarting
-  if ssh "${remote_args[@]}" "sshd -t"; then
-    ssh "${remote_args[@]}" "systemctl restart ssh"
-    ssh "${remote_args[@]}" "rm /etc/ssh/sshd_config.bak"
-  else
-    echo "SSH Config validation failed! Reverting..." >&2
-    ssh "${remote_args[@]}" "mv /etc/ssh/sshd_config.bak /etc/ssh/sshd_config"
-    exit 1
-  fi
+cp "$CONFIG" "$BACKUP"
+
+if grep -q '^#*PermitRootLogin' "$CONFIG"; then
+  sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' "$CONFIG"
+else
+  echo 'PermitRootLogin prohibit-password' >> "$CONFIG"
+fi
+
+if sshd -t; then
+  systemctl restart ssh
+  rm "$BACKUP"
+else
+  echo "SSH Config validation failed! Reverting..." >&2
+  mv "$BACKUP" "$CONFIG"
+  exit 1
+fi
+EOF
 }
 
 rootItemID="$(findOrCreateItem "${user}" "${host}")"
