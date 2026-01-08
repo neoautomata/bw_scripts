@@ -24,7 +24,7 @@ A suite of Bash utilities designed to extend the Bitwarden CLI (`bw`). While the
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/neoautomata/bw_scripts.git](https://github.com/neoautomata/bw_scripts.git)
+    git clone https://github.com/neoautomata/bw_scripts.git
     cd bw_scripts
     ```
 2.  Add the directory to your `$PATH` or move the scripts to somewhere in your existing path (e.g. `~/bin`).
