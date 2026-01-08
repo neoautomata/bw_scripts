@@ -103,10 +103,6 @@ function configSSHKey() {
     chmod 700 "$tmp_dir"
     local keypath="$tmp_dir/${query}"
 
-    fifo="$tmp_dir/ssh_key"
-    mkfifo -m 600 "$fifo"
-    mkfifo -m 600 "${fifo}.pub"
-
     ssh-keygen -t ed25519 -C "${query} per-host key" -N "" -f "${keypath}"
     bw create attachment --itemid "${itemID}" --file "${keypath}.pub"
     bw create attachment --itemid "${itemID}" --file "${keypath}"
