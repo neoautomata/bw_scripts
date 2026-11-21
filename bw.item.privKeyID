@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-itemID="${1}"; shift
-query="${1}"; shift
+UUID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
-bw.item.attachmentID "${itemID}" '.attachments[]? | select(.fileName | startswith($q) and (endswith(".pub") | not))' 'Private key' --arg q "${query}"
+if [[ $# -ne 2 || -z "$1" || -z "$2" ]]; then
+    echo "Usage: ${0##*/} <itemID> <keyPrefix>" >&2
+    exit 1
+fi
+
+itemID="$1"
+query="$2"
+
+if [[ ! "${itemID}" =~ ${UUID_REGEX} ]]; then
+    echo "Error: itemID must be a valid UUID." >&2
+    exit 1
+fi
+
+exec bw.item.attachmentID "${itemID}" --prefix "${query}" --exclude-suffix ".pub" --label "Private key"

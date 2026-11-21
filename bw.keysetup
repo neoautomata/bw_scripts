@@ -1,165 +1,705 @@
 #!/usr/bin/env bash
 
-# set -x
+set -euo pipefail
 
-set -o errexit
-set -o pipefail # Ensure failures in pipes are caught
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+SALT_RE='^[./0-9A-Za-z]{32,}$'
+PUBKEY_RE='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+([[:space:]]+[^[:cntrl:]]*)?$'
 
-bw.sess || { echo "bw.sess failed"; exit 1; }
+is_valid_uuid() {
+  [[ "${1}" =~ ${UUID_RE} ]]
+}
 
-cfg="$(ssh -G "$@")"
-user="$(awk 'tolower($1) == "user" {print $2}' <<<"${cfg}")"
-host="$(awk 'tolower($1) == "host" {print $2}' <<<"${cfg}")"
+is_valid_runtime_dir() {
+  local dir="$1"
+  local require_owner="$2"
+  local fs_type=""
+
+  if [[ "${dir}" != /* ]]; then
+    return 1
+  fi
+  if [[ -L "${dir}" || ! -d "${dir}" || ! -w "${dir}" ]]; then
+    return 1
+  fi
+  if [[ "${require_owner}" -eq 1 && ! -O "${dir}" ]]; then
+    return 1
+  fi
+  fs_type="$(stat -f -c '%T' "${dir}" 2>/dev/null || true)"
+  if [[ "${fs_type}" != "tmpfs" && "${fs_type}" != "ramfs" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: bw.keysetup <ssh-options> root@<host>" >&2
+  exit 1
+fi
+
+if ! bw.sess; then
+  echo "Error: bw.sess failed." >&2
+  exit 1
+fi
+
+if ! cfg="$(ssh -G "$@")"; then
+  echo "Error: ssh -G failed." >&2
+  exit 1
+fi
+
+user="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "user" {print $2; exit}')"
+host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "host" {print $2; exit}')"
+if [[ -z "${host}" ]]; then
+  host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "hostname" {print $2; exit}')"
+fi
 full_ssh=("$@")
 unset cfg
 
-if [[ "${user}" != "root" ]]; then
-  echo "Must use root user, got ${user}"
+if [[ -z "${user}" || -z "${host}" ]]; then
+  echo "Error: SSH configuration lacks user or host." >&2
   exit 1
 fi
 
-function findOrCreateItem() {
-  local user="${1}"; shift
-  local host="${1}"; shift
-  local itemID
-  itemID="$(bw.item.search "${user}@${host}" || echo)"
+if [[ "${user}" != "root" ]]; then
+  echo "Error: Target user must be root, got ${user}." >&2
+  exit 1
+fi
 
-  if [[ -z "${itemID}" ]]; then
-    echo "Creating new ${user}@${host} item" >&2
-    bw get template item | jq --arg name "${user}@${host}" --arg login "$(bw get template item.login | jq --arg user "${user}" --rawfile password <(bw generate -lun --length 32) '.username=$user | .totp="" | .password=$password')" --arg salt "$(bw generate -lun --length 32)" '.notes="" | .name=$name | .login=$login | .fields=[{ name:"password_salt", value:$salt, type:0}]' | bw encode | bw create item
-    bw sync
+if [[ "${host}" == */* ]]; then
+  echo "Error: Host name must not contain a slash." >&2
+  exit 1
+fi
 
-    itemID="$(bw.item.search "${user}@${host}")"
-    if [[ -z "${itemID}" ]]; then
-      echo "Failed fetching newly created item" >&2
-      exit 1
+TMP_DIRS=()
+CREATED_TMP_DIR=""
+
+cleanup_tmp_dirs() {
+  local dir
+  if [[ "${#TMP_DIRS[@]}" -gt 0 ]]; then
+    for dir in "${TMP_DIRS[@]}"; do
+      if [[ -n "${dir}" && -d "${dir}" ]]; then
+        rm -rf -- "${dir}"
+      fi
+    done
+  fi
+  TMP_DIRS=()
+}
+
+trap cleanup_tmp_dirs EXIT
+trap 'cleanup_tmp_dirs; exit 130' INT
+trap 'cleanup_tmp_dirs; exit 143' TERM
+trap 'cleanup_tmp_dirs; exit 129' HUP
+
+make_tmp_dir() {
+  local runtime_dir old_umask dir
+  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  if ! is_valid_runtime_dir "${runtime_dir}" 1; then
+    if is_valid_runtime_dir "/dev/shm" 0; then
+      runtime_dir="/dev/shm"
+    else
+      echo "Error: No writable RAM-backed runtime directory exists." >&2
+      return 1
     fi
+  fi
+
+  old_umask="$(umask)"
+  umask 077
+  dir="$(mktemp -d -p "${runtime_dir}" bw_keysetup.XXXXXXXXXX)"
+  umask "${old_umask}"
+
+  TMP_DIRS+=("${dir}")
+  CREATED_TMP_DIR="${dir}"
+}
+
+remove_tmp_dir() {
+  local target="${1}"
+  local new_dirs=()
+  local dir
+
+  if [[ -n "${target}" && -d "${target}" ]]; then
+    rm -rf -- "${target}"
+  fi
+
+  if [[ "${#TMP_DIRS[@]}" -gt 0 ]]; then
+    for dir in "${TMP_DIRS[@]}"; do
+      if [[ "${dir}" != "${target}" ]]; then
+        new_dirs+=("${dir}")
+      fi
+    done
+  fi
+
+  if [[ "${#new_dirs[@]}" -gt 0 ]]; then
+    TMP_DIRS=("${new_dirs[@]}")
   else
-    echo "${user}@${host} item found" >&2
-  fi
-
-  echo -n "$itemID"
-}
-
-function checkPassLen() {
-  local itemID="${1}"; shift
-
-  if [[ "$(bw.item.pass "${itemID}" | tr -d '\n' | wc -c)" -lt 32 ]]; then
-    echo "Updating password to 32 characters"
-    bw.item.get "${itemID}" | jq -r --rawfile password <(bw generate -lun --length 32) '(.login.password)|=$password' | bw encode | bw edit item "${itemID}"
-    bw sync
+    TMP_DIRS=()
   fi
 }
 
-function checkSaltLen() {
-  local itemID="${1}"; shift
+sh_quote() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
 
-  if [[ "$(bw.item.field "${itemID}" "password_salt" | tr -d '\n' | wc -c)" -lt 32 ]]; then
-    echo "Updating password salt to 32 characters"
-    bw.item.get "${itemID}" | jq -r --arg salt "$(bw generate -lun --length 32)" '(.fields[] | select(.name=="password_salt")).value|=$salt' | bw encode | bw edit item "${itemID}"
-    bw sync
+findOrCreateItem() {
+  local target_user="${1}"
+  local target_host="${2}"
+  local query="${target_user}@${target_host}"
+  local search_rc=0
+  local itemID=""
+
+  itemID="$(bw.item.search "${query}")" || search_rc=$?
+
+  case "${search_rc}" in
+    0)
+      if ! is_valid_uuid "${itemID}"; then
+        echo "Error: Item search returned an invalid UUID for ${query}." >&2
+        return 1
+      fi
+      echo "Found item for ${query}." >&2
+      printf '%s\n' "${itemID}"
+      return 0
+      ;;
+    2)
+      echo "Creating item for ${query}." >&2
+
+      local pw salt
+      if ! pw="$(bw generate -lun --length 32)"; then
+        echo "Error: Password generation failed." >&2
+        return 1
+      fi
+      if [[ "${#pw}" -lt 32 || "${pw}" == *$'\n'* || "${pw}" == *$'\r'* ]]; then
+        unset pw
+        echo "Error: Generated password is invalid." >&2
+        return 1
+      fi
+
+      if ! salt="$(bw generate -lun --length 32)"; then
+        unset pw
+        echo "Error: Salt generation failed." >&2
+        return 1
+      fi
+      if [[ ! "${salt}" =~ ${SALT_RE} ]]; then
+        unset pw salt
+        echo "Error: Generated salt is invalid." >&2
+        return 1
+      fi
+
+      local template_item template_login created_json
+      template_item="$(bw get template item)"
+      template_login="$(bw get template item.login)"
+
+      # Pass secrets through stdin pipes so process argv never contains them.
+      created_json="$(
+        {
+          printf '%s\n' "${template_item}"
+          printf '%s\n' "${template_login}"
+          printf '%s' "${pw}" | jq -Rs .
+          printf '%s' "${salt}" | jq -Rs .
+        } | jq -s --arg name "${query}" --arg username "${target_user}" '
+          .[0] as $item
+          | .[1] as $login
+          | .[2] as $pw
+          | .[3] as $salt
+          | $item
+          | .notes = ""
+          | .name = $name
+          | .login = ($login | .username = $username | .totp = "" | .password = $pw)
+          | .fields = [{name: "password_salt", value: $salt, type: 0}]
+        ' | bw encode | bw create item
+      )"
+      unset pw salt template_item template_login
+
+      if ! itemID="$(printf '%s\n' "${created_json}" | jq -er '.id | strings | select(length > 0)')"; then
+        unset created_json
+        echo "Error: Cannot extract ID from created item for ${query}." >&2
+        return 1
+      fi
+      unset created_json
+
+      if ! is_valid_uuid "${itemID}"; then
+        echo "Error: Created item returned an invalid UUID for ${query}." >&2
+        return 1
+      fi
+
+      bw sync >/dev/null 2>&1 || echo "Warning: Bitwarden sync failed." >&2
+      printf '%s\n' "${itemID}"
+      return 0
+      ;;
+    *)
+      echo "Error: Item search failed for ${query}." >&2
+      return "${search_rc}"
+      ;;
+  esac
+}
+
+checkPassLen() {
+  local itemID="${1}"
+  local pass_rc=0
+  local current_pw=""
+  local needs_regen=0
+
+  current_pw="$(bw.item.pass "${itemID}")" || pass_rc=$?
+  case "${pass_rc}" in
+    0) ;;
+    2) current_pw="" ;;
+    *)
+      echo "Error: Cannot read password for item ${itemID}." >&2
+      return "${pass_rc}"
+      ;;
+  esac
+
+  if [[ "${#current_pw}" -lt 32 || "${current_pw}" == *$'\n'* || "${current_pw}" == *$'\r'* ]]; then
+    needs_regen=1
+  fi
+  unset current_pw
+
+  if [[ "${needs_regen}" -eq 1 ]]; then
+    echo "Updating password to 32 characters."
+    local new_pw item_json
+    if ! new_pw="$(bw generate -lun --length 32)"; then
+      echo "Error: Password generation failed." >&2
+      return 1
+    fi
+    if [[ "${#new_pw}" -lt 32 || "${new_pw}" == *$'\n'* || "${new_pw}" == *$'\r'* ]]; then
+      unset new_pw
+      echo "Error: Generated password is invalid." >&2
+      return 1
+    fi
+
+    item_json="$(bw.item.get "${itemID}")"
+    {
+      printf '%s\n' "${item_json}"
+      printf '%s' "${new_pw}" | jq -Rs .
+    } | jq -s '.[1] as $pw | .[0] | .login.password = $pw' | bw encode | bw edit item "${itemID}" >/dev/null
+    unset new_pw item_json
+
+    bw sync >/dev/null 2>&1 || echo "Warning: Bitwarden sync failed." >&2
   fi
 }
 
-function checkPass() {
-  local itemID="${1}"; shift
-  local user="${1}"; shift
+checkSaltLen() {
+  local itemID="${1}"
+  local salt_rc=0
+  local current_salt=""
+  local needs_regen=0
 
-  prefix="\$y\$j9T\$$(bw.item.field "${itemID}" "password_salt")\$"
-  want="$(bw.item.pass "${itemID}" | perl -e 'my $pass=<STDIN>; chomp($pass); print crypt($pass, $ARGV[0])' -- "${prefix}")"
-  if [[ "${want}" != "${prefix}"* ]]; then
-    echo "Invalid desired ${user} shadow entry: ${want}" >&2
+  current_salt="$(bw.item.field "${itemID}" "password_salt")" || salt_rc=$?
+  case "${salt_rc}" in
+    0) ;;
+    2) current_salt="" ;;
+    *)
+      echo "Error: Cannot read password_salt for item ${itemID}." >&2
+      return "${salt_rc}"
+      ;;
+  esac
+
+  if [[ ! "${current_salt}" =~ ${SALT_RE} ]]; then
+    needs_regen=1
+  fi
+  unset current_salt
+
+  if [[ "${needs_regen}" -eq 1 ]]; then
+    echo "Updating password salt to 32 characters."
+    local new_salt item_json
+    if ! new_salt="$(bw generate -lun --length 32)"; then
+      echo "Error: Salt generation failed." >&2
+      return 1
+    fi
+    if [[ ! "${new_salt}" =~ ${SALT_RE} ]]; then
+      unset new_salt
+      echo "Error: Generated salt is invalid." >&2
+      return 1
+    fi
+
+    item_json="$(bw.item.get "${itemID}")"
+    {
+      printf '%s\n' "${item_json}"
+      printf '%s' "${new_salt}" | jq -Rs .
+    } | jq -s '
+      .[1] as $salt
+      | .[0]
+      | .fields = (
+          ((.fields // []) | map(select(.name != "password_salt")))
+          + [{name: "password_salt", value: $salt, type: 0}]
+        )
+    ' | bw encode | bw edit item "${itemID}" >/dev/null
+    unset new_salt item_json
+
+    bw sync >/dev/null 2>&1 || echo "Warning: Bitwarden sync failed." >&2
+  fi
+}
+
+checkPass() {
+  local itemID="${1}"
+  local target_user="${2}"
+  local prefix want have pw salt remote_user_q remote_script
+
+  pw="$(bw.item.pass "${itemID}")"
+  salt="$(bw.item.field "${itemID}" "password_salt")"
+
+  if [[ -z "${pw}" || "${pw}" == *$'\n'* || "${pw}" == *$'\r'* ]]; then
+    unset pw salt
+    echo "Error: Password for ${target_user} is empty or contains a line break." >&2
+    return 1
+  fi
+
+  if [[ ! "${salt}" =~ ${SALT_RE} ]]; then
+    unset pw salt
+    echo "Error: Password salt for ${target_user} is invalid." >&2
+    return 1
+  fi
+
+  prefix="\$y\$j9T\$${salt}\$"
+  # Pass password and salt through stdin with NUL delimiters so argv never contains them.
+  want="$(
+    printf '%s\0%s\0' "${pw}" "${prefix}" | perl -e '
+      local $/ = "\0";
+      my $pass = <STDIN>;
+      my $pref = <STDIN>;
+      defined($pass) && defined($pref) or exit 1;
+      chomp($pass);
+      chomp($pref);
+      my $hash = crypt($pass, $pref);
+      defined($hash) or exit 1;
+      print $hash;
+    '
+  )"
+  unset pw salt
+
+  if [[ "${want}" != \$y\$* || "${want}" != "${prefix}"* ]]; then
+    echo "Error: Generated Yescrypt hash is invalid for ${target_user}." >&2
+    return 1
+  fi
+
+  remote_user_q="$(printf '%q' "${target_user}")"
+  # shellcheck disable=SC2029
+  have="$(ssh "${full_ssh[@]}" getent shadow "${remote_user_q}" | cut -d: -f2)"
+
+  if [[ "${want}" != "${have}" ]]; then
+    echo "Updating password for ${target_user}."
+
+    IFS= read -r -d '' remote_script <<'EOF' || true
+set -euo pipefail
+target_user="${1}"
+IFS= read -r entry
+expected_hash="${entry#*:}"
+backup=""
+updated=0
+
+cleanup_shadow() {
+  if [[ "${updated}" -ne 1 && -n "${backup}" && -f "${backup}" ]]; then
+    mv -f -- "${backup}" /etc/shadow || true
+  fi
+}
+trap cleanup_shadow EXIT
+trap 'cleanup_shadow; exit 130' INT
+trap 'cleanup_shadow; exit 143' TERM
+trap 'cleanup_shadow; exit 129' HUP
+
+old_umask="$(umask)"
+umask 077
+backup="$(mktemp -p /etc shadow.bw_keysetup.XXXXXXXXXX)"
+umask "${old_umask}"
+cp -a /etc/shadow "${backup}"
+printf "%s\n" "${entry}" | chpasswd -e
+actual_hash="$(getent shadow "${target_user}" | cut -d: -f2)"
+if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+  echo "Error: Remote shadow hash does not match expected hash." >&2
+  exit 1
+fi
+updated=1
+rm -f -- "${backup}"
+EOF
+    printf '%s:%s\n' "${target_user}" "${want}" | ssh "${full_ssh[@]}" bash -c "$(sh_quote "${remote_script}")" _ "${remote_user_q}"
+  else
+    echo "Password matches for ${target_user}."
+  fi
+}
+
+configSSHKey() {
+  local itemID="${1}"
+  local target_user="${2}"
+  local target_host="${3}"
+  local query="${target_user}@${target_host}"
+  local key_rc=0
+  local keyID=""
+
+  keyID="$(bw.item.privKeyID "${itemID}" "${query}")" || key_rc=$?
+
+  case "${key_rc}" in
+    0)
+      if ! is_valid_uuid "${keyID}"; then
+        echo "Error: Private key lookup returned an invalid UUID for ${query}." >&2
+        return 1
+      fi
+      echo "SSH key already exists for ${query}."
+      ;;
+    2)
+      echo "Creating SSH key for ${query}."
+      make_tmp_dir
+      local tmp_dir="${CREATED_TMP_DIR}"
+      local keypath="${tmp_dir}/${query}"
+
+      ssh-keygen -t ed25519 -f "${keypath}" -N "" -C "${query}" >/dev/null
+      # Upload the private key before the public key so failure leaves no orphan .pub.
+      if ! bw create attachment --itemid "${itemID}" --file "${keypath}" >/dev/null; then
+        echo "Error: Cannot upload private key attachment for ${query}." >&2
+        return 1
+      fi
+      if ! bw create attachment --itemid "${itemID}" --file "${keypath}.pub" >/dev/null; then
+        echo "Error: Cannot upload public key attachment for ${query}." >&2
+        return 1
+      fi
+      remove_tmp_dir "${tmp_dir}"
+
+      bw sync >/dev/null 2>&1 || echo "Warning: Bitwarden sync failed." >&2
+      ;;
+    *)
+      echo "Error: Private key lookup failed for ${query}." >&2
+      return "${key_rc}"
+      ;;
+  esac
+
+  local pub_rc=0
+  local pubKeyID=""
+  pubKeyID="$(bw.item.pubKeyID "${itemID}" "${query}")" || pub_rc=$?
+  if [[ "${pub_rc}" -ne 0 ]] || ! is_valid_uuid "${pubKeyID}"; then
+    echo "Error: Cannot find valid public key UUID for ${query}." >&2
+    return 1
+  fi
+
+  local pub_key
+  pub_key="$(bw get attachment "${pubKeyID}" --itemid "${itemID}" --raw)"
+  if [[ -z "${pub_key}" ]]; then
+    echo "Error: Public key attachment is empty for ${query}." >&2
+    return 1
+  fi
+  if [[ "${pub_key}" == *$'\n'* || "${pub_key}" == *$'\r'* ]]; then
+    echo "Error: Public key contains a line break for ${query}." >&2
+    return 1
+  fi
+  if [[ ! "${pub_key}" =~ ${PUBKEY_RE} ]]; then
+    echo "Error: Public key format is invalid for ${query}." >&2
+    return 1
+  fi
+  if ! printf '%s\n' "${pub_key}" | ssh-keygen -l -f /dev/stdin >/dev/null 2>&1; then
+    echo "Error: Public key failed ssh-keygen check for ${query}." >&2
+    return 1
+  fi
+
+  local remote_user_q install_key_script
+  remote_user_q="$(printf '%q' "${target_user}")"
+  IFS= read -r -d '' install_key_script <<'EOF' || true
+set -euo pipefail
+target_user="${1}"
+IFS= read -r pub_key
+if [[ -z "${pub_key}" ]]; then
+  echo "Error: Public key input is empty." >&2
+  exit 1
+fi
+passwd_entry="$(getent passwd "${target_user}")"
+home_dir="$(printf "%s\n" "${passwd_entry}" | cut -d: -f6)"
+if [[ -z "${home_dir}" || -L "${home_dir}" || ! -d "${home_dir}" ]]; then
+  echo "Error: Home directory is invalid for ${target_user}." >&2
+  exit 1
+fi
+
+user_install_script='
+set -eu
+IFS= read -r home_dir
+IFS= read -r pub_key
+ssh_dir="${home_dir}/.ssh"
+auth_keys="${ssh_dir}/authorized_keys"
+if [ -L "${ssh_dir}" ]; then
+  echo "Error: SSH directory is a symlink." >&2
+  exit 1
+fi
+if [ -e "${ssh_dir}" ] && [ ! -d "${ssh_dir}" ]; then
+  echo "Error: SSH path is not a directory." >&2
+  exit 1
+fi
+umask 077
+mkdir -p -- "${ssh_dir}"
+chmod 700 -- "${ssh_dir}"
+if [ -L "${auth_keys}" ]; then
+  echo "Error: authorized_keys is a symlink." >&2
+  exit 1
+fi
+if [ -e "${auth_keys}" ] && [ ! -f "${auth_keys}" ]; then
+  echo "Error: authorized_keys is not a regular file." >&2
+  exit 1
+fi
+tmp_keys="$(mktemp -p "${ssh_dir}" authorized_keys.bw_keysetup.XXXXXXXXXX)"
+trap '\''rm -f -- "${tmp_keys}"'\'' EXIT HUP INT TERM
+chmod 600 -- "${tmp_keys}"
+if [ -f "${auth_keys}" ]; then
+  cat -- "${auth_keys}" > "${tmp_keys}"
+fi
+if ! grep -qxF -- "${pub_key}" "${tmp_keys}"; then
+  printf "%s\n" "${pub_key}" >> "${tmp_keys}"
+fi
+mv -f -- "${tmp_keys}" "${auth_keys}"
+trap - EXIT HUP INT TERM
+'
+
+if [[ "${target_user}" == "root" ]]; then
+  {
+    printf '%s\n' "${home_dir}"
+    printf '%s\n' "${pub_key}"
+  } | sh -eu -c "${user_install_script}"
+else
+  target_uid="$(id -u "${target_user}")"
+  if [[ "${target_uid}" == "0" ]]; then
+    echo "Error: Non-root user ${target_user} has UID 0." >&2
     exit 1
   fi
-  have="$(ssh "${full_ssh[@]}" getent shadow "\"${user}\"" | cut -d: -f2)"
-  if [[ "$want" != "$have" ]]; then
-    echo "Updating ${user} password"
-
-    ssh "${full_ssh[@]}" cp /etc/shadow /etc/shadow.backup
-    ssh "${full_ssh[@]}" chpasswd -e <<<"${user}:${want}"
-    ssh "${full_ssh[@]}" pwck -q || {
-      echo "Update failed pwck" 2>&1;
-      ssh "${full_ssh[@]}" mv /etc/shadow.backup /etc/shadow;
-      exit 1;
-    }
-    # TODO: check password works somehow (login?)
-    ssh "${full_ssh[@]}" rm /etc/shadow.backup
-  else
-    echo "${user} password matches"
+  home_uid="$(stat -c '%u' "${home_dir}")"
+  if [[ "${home_uid}" != "${target_uid}" ]]; then
+    echo "Error: Home directory is not owned by ${target_user}." >&2
+    exit 1
   fi
+  # Drop privileges to target_user so symlinks cannot write to root files.
+  {
+    printf '%s\n' "${home_dir}"
+    printf '%s\n' "${pub_key}"
+  } | if command -v runuser >/dev/null 2>&1; then
+    runuser -u "${target_user}" -- sh -eu -c "${user_install_script}"
+  else
+    su -s /bin/sh "${target_user}" -c "${user_install_script}"
+  fi
+fi
+EOF
+  printf '%s\n' "${pub_key}" | ssh "${full_ssh[@]}" bash -c "$(sh_quote "${install_key_script}")" _ "${remote_user_q}"
 }
 
-function configSSHKey() {
-  local itemID="${1}"; shift
-  local query="${1}"; shift
-
-  keyID="$(bw.item.privKeyID "${itemID}" "${query}" || true)"
-  if [[ -z "$keyID" ]]; then
-    echo "Creating SSH key"
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d -p "/run/user/$(id -u)/" bw_ssh.XXXXXXXXXX) # Create a temporary directory for the keys
-    trap 'rm -rf "$tmp_dir"' EXIT # ensures the dir is deleted regardless of success or failure
-    chmod 700 "$tmp_dir"
-    local keypath="$tmp_dir/${query}"
-
-    ssh-keygen -t ed25519 -C "${query} per-host key" -N "" -f "${keypath}"
-    bw create attachment --itemid "${itemID}" --file "${keypath}.pub"
-    bw create attachment --itemid "${itemID}" --file "${keypath}"
-    bw sync
-  else
-    echo "SSH Key already present"
-    return
-  fi
-
-  ssh-copy-id -i <(bw get attachment "${query}.pub" --itemid "${itemID}" --raw) "${user}@${host}"
+ensureJumperUser() {
+  ssh "${full_ssh[@]}" "if ! id -u jumper >/dev/null 2>&1; then useradd -m -c 'jumper user' jumper; fi"
 }
 
-function updateSSHDConfig() {
+updateSSHDConfig() {
   local remote_args=("$@")
-  
-  echo "Hardening PermitRootLogin..."
-  
+
+  echo "Configuring PermitRootLogin prohibit-password."
+
   ssh "${remote_args[@]}" /usr/bin/env bash << 'EOF'
-set -e
+set -euo pipefail
+
 CONFIG="/etc/ssh/sshd_config"
-BACKUP="/etc/ssh/sshd_config.bak"
+DROPIN_DIR="/etc/ssh/sshd_config.d"
+DROPIN_FILE="${DROPIN_DIR}/00-bw-keysetup.conf"
+BACKUP=""
+TARGET=""
+TMP_CFG=""
+EXISTED=0
+COMMITTED=0
 
-cp "$CONFIG" "$BACKUP"
+revert_sshd() {
+  if [[ -n "${TMP_CFG}" && -f "${TMP_CFG}" ]]; then
+    rm -f -- "${TMP_CFG}" || true
+  fi
+  if [[ "${COMMITTED}" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "${EXISTED}" -eq 1 && -n "${BACKUP}" && -f "${BACKUP}" ]]; then
+    mv -f -- "${BACKUP}" "${TARGET}" || true
+  elif [[ "${EXISTED}" -eq 0 && -n "${TARGET}" && -f "${TARGET}" ]]; then
+    rm -f -- "${TARGET}" || true
+  fi
+}
+trap revert_sshd EXIT
+trap 'revert_sshd; exit 130' INT
+trap 'revert_sshd; exit 143' TERM
+trap 'revert_sshd; exit 129' HUP
 
-if grep -q '^#*PermitRootLogin' "$CONFIG"; then
-  sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' "$CONFIG"
+if [[ -d "${DROPIN_DIR}" ]] && grep -Eiq '^[[:space:]]*Include([[:space:]]+|=)/etc/ssh/sshd_config\.d/\*\.conf' "${CONFIG}"; then
+  TARGET="${DROPIN_FILE}"
+  BACKUP="${DROPIN_FILE}.bak"
+  if [[ -f "${TARGET}" ]]; then
+    EXISTED=1
+    cp -a "${TARGET}" "${BACKUP}"
+  fi
+  printf 'PermitRootLogin prohibit-password\n' > "${TARGET}"
+  chmod 644 "${TARGET}"
 else
-  echo 'PermitRootLogin prohibit-password' >> "$CONFIG"
+  TARGET="${CONFIG}"
+  BACKUP="${CONFIG}.bak"
+  EXISTED=1
+  cp -a "${CONFIG}" "${BACKUP}"
+
+  TMP_CFG="$(mktemp -p /etc/ssh sshd_config.bw_keysetup.XXXXXXXXXX)"
+  awk '
+    BEGIN { updated = 0; in_match = 0 }
+    !in_match && tolower($0) ~ /^[[:space:]]*match[[:space:]=]/ {
+      if (!updated) {
+        print "PermitRootLogin prohibit-password"
+        updated = 1
+      }
+      in_match = 1
+    }
+    !in_match && tolower($0) ~ /^[[:space:]]*#*[[:space:]]*permitrootlogin([[:space:]=]|$)/ {
+      if (!updated) {
+        print "PermitRootLogin prohibit-password"
+        updated = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print "PermitRootLogin prohibit-password"
+      }
+    }
+  ' "${CONFIG}" > "${TMP_CFG}"
+  cat "${TMP_CFG}" > "${CONFIG}"
+  rm -f -- "${TMP_CFG}"
+  TMP_CFG=""
 fi
 
-if sshd -t; then
-  systemctl restart ssh
-  rm "$BACKUP"
-else
-  echo "SSH Config validation failed! Reverting..." >&2
-  mv "$BACKUP" "$CONFIG"
+if ! sshd -t; then
+  echo "Error: sshd configuration check failed." >&2
   exit 1
+fi
+
+if ! effective_cfg="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)"; then
+  echo "Error: Cannot read effective sshd configuration." >&2
+  exit 1
+fi
+effective_root_login="$(printf '%s\n' "${effective_cfg}" | awk 'tolower($1) == "permitrootlogin" { print tolower($2); exit }')"
+effective_pubkey="$(printf '%s\n' "${effective_cfg}" | awk 'tolower($1) == "pubkeyauthentication" { print tolower($2); exit }')"
+if [[ "${effective_root_login}" != "prohibit-password" ]]; then
+  echo "Error: Effective PermitRootLogin is '${effective_root_login}', expected prohibit-password." >&2
+  exit 1
+fi
+if [[ "${effective_pubkey}" != "yes" ]]; then
+  echo "Error: Effective PubkeyAuthentication is '${effective_pubkey}', expected yes." >&2
+  exit 1
+fi
+
+if systemctl list-unit-files ssh.service --no-legend 2>/dev/null | grep -q '^ssh\.service'; then
+  systemctl reload-or-restart ssh.service
+elif systemctl list-unit-files sshd.service --no-legend 2>/dev/null | grep -q '^sshd\.service'; then
+  systemctl reload-or-restart sshd.service
+else
+  echo "Error: Cannot find ssh or sshd systemd unit." >&2
+  exit 1
+fi
+
+COMMITTED=1
+if [[ -n "${BACKUP}" && -f "${BACKUP}" ]]; then
+  rm -f -- "${BACKUP}"
 fi
 EOF
 }
 
 rootItemID="$(findOrCreateItem "${user}" "${host}")"
-
 checkPassLen "${rootItemID}"
 checkSaltLen "${rootItemID}"
 checkPass "${rootItemID}" "root"
-configSSHKey "${rootItemID}" "root@${host}"
+configSSHKey "${rootItemID}" "root" "${host}"
 
-# Fetch/create the jumper item
 jumperItemID="$(findOrCreateItem "jumper" "${host}")"
 checkPassLen "${jumperItemID}"
 checkSaltLen "${jumperItemID}"
-ssh "$@" id jumper || {
-  echo "Creating jumper user";
-  ssh "$@" "useradd -m -c "jumper user" jumper"
-}
+ensureJumperUser
 checkPass "${jumperItemID}" "jumper"
-configSSHKey "${jumperItemID}" "jumper@${host}"
+configSSHKey "${jumperItemID}" "jumper" "${host}"
 
 updateSSHDConfig "${full_ssh[@]}"

@@ -1,38 +1,98 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-TIMEOUT=900 # 15 minutes
+if [[ $# -ne 0 ]]; then
+    echo "Usage: ${0##*/}" >&2
+    exit 1
+fi
 
-# Check if a valid session already exists in the user keyring
-if KEY_ID=$(keyctl request user bw_session @u 2>/dev/null); then
-    if bw unlock --check >/dev/null 2>&1; then
-        exit 0
+TIMEOUT="${BW_SESSION_TIMEOUT:-900}"
+if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]*$ || ${#TIMEOUT} -gt 5 || "$TIMEOUT" -gt 86400 ]]; then
+    echo "Error: BW_SESSION_TIMEOUT must be an integer from 1 to 86400." >&2
+    exit 1
+fi
+
+KEYRING="${BW_KEYRING:-@u}"
+if [[ "$KEYRING" != "@u" && "$KEYRING" != "@s" ]]; then
+    echo "Error: BW_KEYRING must be @u or @s." >&2
+    exit 1
+fi
+
+if ! command -v keyctl >/dev/null 2>&1; then
+    echo "Error: keyctl is not in PATH." >&2
+    exit 1
+fi
+
+if ! command -v bw.bin >/dev/null 2>&1; then
+    echo "Error: bw.bin is not in PATH." >&2
+    exit 1
+fi
+
+# Check whether the keyring holds an unlocked session key.
+if KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" && [[ -n "$KEY_ID" ]]; then
+    if existing_key="$(keyctl pipe "$KEY_ID" 2>/dev/null)" && [[ -n "$existing_key" ]]; then
+        if BW_SESSION="$existing_key" bw.bin unlock --check >/dev/null 2>&1; then
+            exit 0
+        fi
+    fi
+    # Revoke and unlink the stale key before re-authenticating.
+    keyctl revoke "$KEY_ID" >/dev/null 2>&1 || true
+    keyctl unlink "$KEY_ID" "$KEYRING" >/dev/null 2>&1 || true
+fi
+
+# Log in if no account session exists.
+if ! bw.bin login --check >/dev/null 2>&1; then
+    if ! bw.bin login >&2; then
+        echo "Error: bw.bin login failed." >&2
+        exit 1
     fi
 fi
 
-# Login if needed
-if ! bw.bin login --check >/dev/null 2>&1; then
-    bw.bin login >&2 || { echo "bw login failed" >&2; exit 1; }
-fi
-
-# Unlock and Capture Key
-key="$(bw.bin unlock --raw)"
-if [[ $? -ne 0 ]] || [[ -z "$key" ]]; then
-    echo "bw unlock failed" >&2
+# Unlock the vault and capture the session key.
+if ! key="$(bw.bin unlock --raw)" || [[ -z "$key" ]]; then
+    echo "Error: bw.bin unlock failed." >&2
     exit 2
 fi
 
-# Add the key to the User (@u) keyring so it's shared across all shells
-# 'padd' reads from stdin; we use echo -n to avoid trailing newlines
-KEY_ID="$(echo -n "$key" | keyctl padd user bw_session @u)"
+KEY_ID=""
+timeout_set=0
+# shellcheck disable=SC2317
+cleanup_new_key() {
+    if [[ "${timeout_set}" -eq 0 && -n "${KEY_ID}" ]]; then
+        keyctl revoke "$KEY_ID" >/dev/null 2>&1 || true
+        keyctl unlink "$KEY_ID" "$KEYRING" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup_new_key EXIT INT TERM HUP
 
-# Set the initial expiration
-keyctl timeout "$KEY_ID" "$TIMEOUT"
+# Store the session key in the configured keyring.
+if ! KEY_ID="$(printf '%s' "$key" | keyctl padd user bw_session "$KEYRING")" || [[ -z "$KEY_ID" ]]; then
+    KEY_ID=""
+    echo "Error: keyctl failed to store the session key." >&2
+    exit 1
+fi
 
-# Sync if last sync was > 8 hours ago
-LAST_SYNC=$(date --date="$(bw.bin sync --last)" +%s)
-EIGHT_HOURS_AGO=$(( $(date +%s) - 8*60*60 ))
+# Restrict key permissions to the possessor.
+if ! keyctl setperm "$KEY_ID" 0x3f000000; then
+    echo "Error: keyctl failed to set permissions on the session key." >&2
+    exit 1
+fi
+
+# Set the session key timeout. The exit trap revokes the key if this fails.
+if ! keyctl timeout "$KEY_ID" "$TIMEOUT"; then
+    echo "Error: keyctl failed to set the timeout." >&2
+    exit 1
+fi
+timeout_set=1
+
+# Sync the vault if the last sync occurred more than 8 hours ago.
+last_sync_raw="$(BW_SESSION="$key" bw.bin sync --last </dev/null 2>/dev/null || true)"
+if [[ -z "$last_sync_raw" || "$last_sync_raw" == "null" ]] || ! LAST_SYNC="$(date --date="$last_sync_raw" +%s 2>/dev/null)" || [[ -z "$LAST_SYNC" ]]; then
+    LAST_SYNC=0
+fi
+EIGHT_HOURS_AGO=$(( $(date +%s) - 8 * 60 * 60 ))
 if [[ "$LAST_SYNC" -lt "$EIGHT_HOURS_AGO" ]]; then
-    bw.bin sync >/dev/null 2>&1 || echo "WARN: bw sync failed" >&2
+    BW_SESSION="$key" bw.bin sync </dev/null >/dev/null 2>&1 || echo "Warning: Bitwarden sync failed." >&2
 fi
 
 exit 0

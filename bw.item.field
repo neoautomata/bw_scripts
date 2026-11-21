@@ -1,25 +1,47 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Check for required arguments
-if [[ "$#" -lt 2 ]]; then
-  echo "Usage: $0 <itemID> <fieldName>" >&2
-  exit 1
+UUID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+if [[ $# -ne 2 || -z "$1" || -z "$2" ]]; then
+    echo "Usage: ${0##*/} <itemID> <fieldName>" >&2
+    exit 1
 fi
 
-itemID="${1}"; shift
-name="${1}"; shift
+itemID="$1"
+name="$2"
 
-itemJSON="$(bw.item.get "${itemID}" 2>/dev/null)"
-
-if [[ "$?" -ne 0 || -z "$itemJSON" ]]; then
-  echo "Error: Could not retrieve item ${itemID}." >&2
-  exit 1
+if [[ ! "${itemID}" =~ ${UUID_REGEX} ]]; then
+    echo "Error: itemID must be a valid UUID." >&2
+    exit 1
 fi
 
-cnt="$(jq --arg name "${name}" '[.fields[]? | select(.name==$name)] | length' <<<"${itemJSON}")"
-if [[ "${cnt}" -ne 1 ]]; then
-  echo "Item ${itemID} field ${name} not found: ${cnt} items (need 1)" >&2
-  exit 2
+if ! itemJSON="$(bw.item.get "${itemID}")" || [[ -z "$itemJSON" ]]; then
+    echo "Error: Bitwarden failed to read item ${itemID}." >&2
+    exit 1
 fi
 
-jq -r --arg name "${name}" '.fields[]? | select(.name==$name) | .value' <<<"${itemJSON}"
+if ! cnt="$(printf '%s' "${itemJSON}" | jq -r --arg name "${name}" '[.fields[]? | select(type == "object" and .name == $name)] | length')"; then
+    echo "Error: jq failed to parse item ${itemID}." >&2
+    exit 1
+fi
+
+if [[ ! "${cnt}" =~ ^[0-9]+$ ]]; then
+    echo "Error: jq returned a non-numeric field count." >&2
+    exit 1
+fi
+
+if [[ "${cnt}" -eq 0 ]]; then
+    echo "Error: Item ${itemID} has 0 fields named ${name}." >&2
+    exit 2
+fi
+
+if [[ "${cnt}" -gt 1 ]]; then
+    echo "Error: Item ${itemID} has ${cnt} fields named ${name}. Expected 1." >&2
+    exit 3
+fi
+
+if ! printf '%s' "${itemJSON}" | jq -r --arg name "${name}" '.fields[]? | select(type == "object" and .name == $name) | if .value == null then "" else (.value | tostring) end'; then
+    echo "Error: jq failed to read field ${name}." >&2
+    exit 1
+fi

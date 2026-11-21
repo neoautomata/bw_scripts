@@ -1,45 +1,174 @@
 #!/usr/bin/env bash
 
-set -o errexit
+set -euo pipefail
 
-bw.sess || { echo "bw.sess failed"; exit 1; }
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
-cfg="$(ssh -G "$@")"
-user="$(awk 'tolower($1) == "user" {print $2}' <<<"${cfg}")"
-host="$(awk 'tolower($1) == "host" {print $2}' <<<"${cfg}")"
-unset cfg
+is_valid_uuid() {
+  [[ "${1}" =~ ${UUID_RE} ]]
+}
 
-itemID="$(bw.item.search "${user}@${host}")"
-if [[ -z "${itemID}" ]]; then
+is_valid_runtime_dir() {
+  local dir="$1"
+  local require_owner="$2"
+  local fs_type=""
+
+  if [[ "${dir}" != /* ]]; then
+    return 1
+  fi
+  if [[ -L "${dir}" || ! -d "${dir}" || ! -w "${dir}" ]]; then
+    return 1
+  fi
+  if [[ "${require_owner}" -eq 1 && ! -O "${dir}" ]]; then
+    return 1
+  fi
+  fs_type="$(stat -f -c '%T' "${dir}" 2>/dev/null || true)"
+  if [[ "${fs_type}" != "tmpfs" && "${fs_type}" != "ramfs" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: bw.ssh <ssh-options> <destination> [command]" >&2
   exit 1
 fi
 
-privkeyID="$(bw.item.privKeyID "${itemID}" "${user}@${host}")"
-
-if [[ -z "${privkeyID}" ]]; then
-  echo -e "Using password ..."
-
-  tmp_dir=$(mktemp -d -p "/run/user/$(id -u)/" bw_ssh.XXXXXXXXXX) # Create a temporary directory for the pipe
-  trap 'rm -rf "$tmp_dir"' EXIT # ensures the pipe is deleted regardless of success or failure
-
-  fifo="$tmp_dir/askpass_fifo"
-  mkfifo -m 600 "$fifo"
-
-  # Create the askpass script
-  askpass_script="$tmp_dir/askpass.sh"
-  cat <<EOF > "$askpass_script"
-#!/bin/bash
-cat "$fifo"
-EOF
-  chmod +x "$askpass_script"
-
-  # Fetch password from Bitwarden and feed it into the pipe in the background
-  bw.item.pass "$itemID" > "$fifo" &
-
-  # Execute SSH
-  exec env SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE='force' ssh "$@"
+if ! bw.sess; then
+  echo "Error: bw.sess failed." >&2
+  exit 1
 fi
 
-# add the key with a 15 sec timeout
-bw get attachment "${privkeyID}" --itemid "${itemID}" --raw | ssh-add -t 15 - >/dev/null || { echo "Failed loading private key"; exit 1; }
-exec ssh "$@"
+if ! cfg="$(ssh -G "$@")"; then
+  echo "Error: ssh -G failed." >&2
+  exit 1
+fi
+
+user="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "user" {print $2; exit}')"
+host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "host" {print $2; exit}')"
+if [[ -z "${host}" ]]; then
+  host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "hostname" {print $2; exit}')"
+fi
+unset cfg
+
+if [[ -z "${user}" || -z "${host}" ]]; then
+  echo "Error: SSH configuration lacks user or host." >&2
+  exit 1
+fi
+
+query="${user}@${host}"
+
+tmp_dir=""
+agent_started=0
+# shellcheck disable=SC2317
+cleanup() {
+  if [[ "${agent_started}" -eq 1 ]]; then
+    ssh-agent -k >/dev/null 2>&1 || true
+    agent_started=0
+  fi
+  if [[ -n "${tmp_dir}" && -d "${tmp_dir}" ]]; then
+    rm -rf -- "${tmp_dir}"
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
+
+search_rc=0
+itemID="$(bw.item.search "${query}")" || search_rc=$?
+if [[ "${search_rc}" -ne 0 ]]; then
+  exit "${search_rc}"
+fi
+if ! is_valid_uuid "${itemID}"; then
+  echo "Error: Item search returned an invalid UUID for ${query}." >&2
+  exit 1
+fi
+
+key_rc=0
+privkeyID="$(bw.item.privKeyID "${itemID}" "${query}")" || key_rc=$?
+
+case "${key_rc}" in
+  0)
+    if ! is_valid_uuid "${privkeyID}"; then
+      echo "Error: Private key lookup returned an invalid UUID for ${query}." >&2
+      exit 1
+    fi
+
+    # Start an isolated ssh-agent so keys do not leak into a shared agent.
+    if ! agent_env="$(ssh-agent -s)"; then
+      echo "Error: Cannot start ssh-agent." >&2
+      exit 1
+    fi
+    eval "${agent_env}" >/dev/null
+    agent_started=1
+
+    # Load the private key into the isolated ssh-agent for 15 seconds.
+    if ! bw get attachment "${privkeyID}" --itemid "${itemID}" --raw | ssh-add -t 15 - >/dev/null; then
+      echo "Error: Cannot load private key into ssh-agent." >&2
+      exit 1
+    fi
+
+    # Run ssh without exec so the EXIT trap stops the isolated ssh-agent.
+    ssh_rc=0
+    ssh "$@" || ssh_rc=$?
+    exit "${ssh_rc}"
+    ;;
+  2)
+    if ! pw="$(bw.item.pass "${itemID}")"; then
+      echo "Error: Cannot fetch password for ${query}." >&2
+      exit 1
+    fi
+
+    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if ! is_valid_runtime_dir "${runtime_dir}" 1; then
+      if is_valid_runtime_dir "/dev/shm" 0; then
+        runtime_dir="/dev/shm"
+      else
+        unset pw
+        echo "Error: No writable RAM-backed runtime directory exists." >&2
+        exit 1
+      fi
+    fi
+
+    old_umask="$(umask)"
+    umask 077
+    tmp_dir="$(mktemp -d -p "${runtime_dir}" bw_ssh.XXXXXXXXXX)"
+    pass_file="${tmp_dir}/pass"
+    printf '%s\n' "${pw}" > "${pass_file}"
+    chmod 600 "${pass_file}"
+    unset pw
+
+    pass_file_q="$(printf '%q' "${pass_file}")"
+    askpass_script="${tmp_dir}/askpass.sh"
+    cat > "${askpass_script}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  *[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]*|*[Pp][Aa][Ss][Ss][Cc][Oo][Dd][Ee]*)
+    exec 3< ${pass_file_q} 2>/dev/null || exit 1
+    rm -f -- ${pass_file_q}
+    exec cat <&3
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+    chmod 700 "${askpass_script}"
+    umask "${old_umask}"
+
+    echo "Using password authentication for ${query}." >&2
+
+    # Run ssh without exec so the EXIT trap removes tmp_dir.
+    # Disable ControlMaster so background multiplexers do not inherit SSH_ASKPASS.
+    ssh_rc=0
+    env SSH_ASKPASS="${askpass_script}" SSH_ASKPASS_REQUIRE='force' \
+      ssh -o ControlMaster=no -o ControlPersist=no "$@" || ssh_rc=$?
+    exit "${ssh_rc}"
+    ;;
+  *)
+    echo "Error: Private key lookup failed for ${query}." >&2
+    exit "${key_rc}"
+    ;;
+esac

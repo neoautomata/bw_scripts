@@ -1,16 +1,92 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-KEY_ID=$(keyctl request user bw_session @u 2>/dev/null)
-if [[ $? -ne 0 ]]; then
-    bw.sess || exit 1
-    KEY_ID=$(keyctl request user bw_session @u)
+TIMEOUT="${BW_SESSION_TIMEOUT:-900}"
+if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]*$ || ${#TIMEOUT} -gt 5 || "$TIMEOUT" -gt 86400 ]]; then
+    echo "Error: BW_SESSION_TIMEOUT must be an integer from 1 to 86400." >&2
+    exit 1
 fi
 
-# reset the timer to 15 mins (900s) on every use
-keyctl timeout "$KEY_ID" 900
+KEYRING="${BW_KEYRING:-@u}"
+if [[ "$KEYRING" != "@u" && "$KEYRING" != "@s" ]]; then
+    echo "Error: BW_KEYRING must be @u or @s." >&2
+    exit 1
+fi
 
-# 4. Export the session key and run the command
-BW_SESSION=$(keyctl pipe "$KEY_ID")
+if ! command -v keyctl >/dev/null 2>&1; then
+    echo "Error: keyctl is not in PATH." >&2
+    exit 1
+fi
+
+if ! command -v bw.bin >/dev/null 2>&1; then
+    echo "Error: bw.bin is not in PATH." >&2
+    exit 1
+fi
+
+# Handle subcommands that must revoke or bypass the cached session key.
+case "${1:-}" in
+    lock|logout)
+        if KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" && [[ -n "$KEY_ID" ]]; then
+            keyctl revoke "$KEY_ID" >/dev/null 2>&1 || true
+            keyctl unlink "$KEY_ID" "$KEYRING" >/dev/null 2>&1 || true
+        fi
+        unset BW_SESSION
+        exec bw.bin "$@"
+        ;;
+    --help|-h|--version|-v|help|login|unlock|status|config)
+        exec bw.bin "$@"
+        ;;
+    serve)
+        echo "Error: bw does not inject BW_SESSION into bw serve. Run bw.bin serve directly." >&2
+        exit 1
+        ;;
+esac
+
+refreshed=0
+if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z "$KEY_ID" ]]; then
+    if ! bw.sess; then
+        echo "Error: bw.sess failed." >&2
+        exit 1
+    fi
+    refreshed=1
+    if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z "$KEY_ID" ]]; then
+        echo "Error: Keyring ${KEYRING} does not contain bw_session." >&2
+        exit 1
+    fi
+fi
+
+# Refresh the timeout and read the key. Retry once via bw.sess if the key expired mid-flight.
+if [[ "$refreshed" -eq 0 ]]; then
+    if keyctl timeout "$KEY_ID" "$TIMEOUT" 2>/dev/null && BW_SESSION="$(keyctl pipe "$KEY_ID" 2>/dev/null)" && [[ -n "$BW_SESSION" ]]; then
+        export BW_SESSION
+        exec bw.bin "$@"
+    fi
+    if ! bw.sess; then
+        echo "Error: bw.sess failed." >&2
+        exit 1
+    fi
+    if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z "$KEY_ID" ]]; then
+        echo "Error: Keyring ${KEYRING} does not contain bw_session." >&2
+        exit 1
+    fi
+fi
+
+# Reset the session key timeout on each use.
+if ! keyctl timeout "$KEY_ID" "$TIMEOUT"; then
+    echo "Error: keyctl failed to set the timeout." >&2
+    exit 1
+fi
+
+# Export the session key and run the Bitwarden CLI.
+if ! BW_SESSION="$(keyctl pipe "$KEY_ID")"; then
+    echo "Error: keyctl failed to read the session key." >&2
+    exit 1
+fi
+
+if [[ -z "$BW_SESSION" ]]; then
+    echo "Error: Session key is empty." >&2
+    exit 1
+fi
+
 export BW_SESSION
-
-bw.bin "$@"
+exec bw.bin "$@"
