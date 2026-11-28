@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(CDPATH="" cd -- "${SCRIPT_DIR}/.." && pwd)"
 BW_SESS="${REPO_ROOT}/bw.sess"
 
 TMP_ROOT="$(mktemp -d)"
@@ -20,7 +20,7 @@ setup_env() {
     STATE_DIR="${TEST_DIR}/state"
     mkdir -p "${MOCK_BIN}" "${STATE_DIR}"
 
-    # Poison wrapper to ensure bw.sess never invokes bw directly.
+    # Poison wrapper to ensure bw.sess never calls bw directly.
     cat > "${MOCK_BIN}/bw" << 'EOF'
 #!/usr/bin/env bash
 echo "bw-wrapper" >> "${MOCK_STATE_DIR}/calls.log"
@@ -45,6 +45,9 @@ case "${cmd}" in
         exit 1
         ;;
     pipe)
+        if [[ -f "${state}/keyctl_pipe_fail" ]]; then
+            exit 1
+        fi
         if [[ -f "${state}/existing_key_value" ]]; then
             cat "${state}/existing_key_value"
             exit 0
@@ -64,6 +67,10 @@ case "${cmd}" in
         ;;
     setperm)
         printf '%s %s\n' "${2:-}" "${3:-}" >> "${state}/setperm.log"
+        if [[ -f "${state}/pause_in_setperm" ]]; then
+            : > "${state}/setperm_ready"
+            sleep 0.3
+        fi
         if [[ -f "${state}/keyctl_setperm_fail" ]]; then
             exit 1
         fi
@@ -71,6 +78,10 @@ case "${cmd}" in
         ;;
     timeout)
         printf '%s %s\n' "${2:-}" "${3:-}" >> "${state}/timeout.log"
+        if [[ -f "${state}/keyctl_timeout_fail_once" ]]; then
+            rm -f "${state}/keyctl_timeout_fail_once"
+            exit 1
+        fi
         if [[ -f "${state}/keyctl_timeout_fail" ]]; then
             exit 1
         fi
@@ -98,30 +109,52 @@ set -euo pipefail
 state="${MOCK_STATE_DIR}"
 printf 'bw.bin %s\n' "$*" >> "${state}/calls.log"
 
+capture_stdin() {
+    local target="$1"
+    if [[ -f "${state}/capture_stdin" ]]; then
+        local line=""
+        if IFS= read -r -t 0.1 line; then
+            printf '%s' "${line}" > "${target}"
+        else
+            : > "${target}"
+        fi
+    fi
+}
+
 case "${1:-} ${2:-}" in
     "unlock --check")
         printf '%s' "${BW_SESSION:-}" > "${state}/unlock_check_session"
+        capture_stdin "${state}/unlock_check_stdin"
         if [[ -f "${state}/unlock_check_ok" ]]; then
             exit 0
         fi
         exit 1
         ;;
     "login --check")
+        printf '%s' "${BW_SESSION:-}" > "${state}/login_check_session"
+        capture_stdin "${state}/login_check_stdin"
         if [[ -f "${state}/login_check_fail" ]]; then
             exit 1
         fi
         exit 0
         ;;
-    "login ")
-        if [[ -f "${state}/login_stdout" ]]; then
-            cat "${state}/login_stdout"
+    "login --raw")
+        printf '%s' "${BW_SESSION:-}" > "${state}/login_raw_session"
+        capture_stdin "${state}/login_raw_stdin"
+        if [[ -f "${state}/login_stderr" ]]; then
+            cat "${state}/login_stderr" >&2
         fi
         if [[ -f "${state}/login_fail" ]]; then
             exit 1
         fi
+        if [[ -f "${state}/login_raw_key" ]]; then
+            cat "${state}/login_raw_key"
+        fi
         exit 0
         ;;
     "unlock --raw")
+        printf '%s' "${BW_SESSION:-}" > "${state}/unlock_raw_session"
+        capture_stdin "${state}/unlock_raw_stdin"
         if [[ -f "${state}/unlock_raw_fail" ]]; then
             exit 1
         fi
@@ -142,6 +175,10 @@ case "${1:-} ${2:-}" in
         ;;
     "sync ")
         printf '%s' "${BW_SESSION:-}" > "${state}/sync_session"
+        if [[ -f "${state}/pause_in_sync" ]]; then
+            : > "${state}/sync_ready"
+            sleep 0.3
+        fi
         if [[ -f "${state}/sync_fail" ]]; then
             exit 1
         fi
@@ -160,7 +197,11 @@ run_case() {
     local name="$1"
     shift
     setup_env
-    if ( "$@" ); then
+    set +e
+    ( set -euo pipefail; "$@" )
+    local rc=$?
+    set -e
+    if [[ "${rc}" -eq 0 ]]; then
         echo "  PASS: ${name}"
         PASS_COUNT=$((PASS_COUNT + 1))
     else
@@ -215,22 +256,70 @@ iso_hours_ago() {
     date -u --date="${hours} hours ago" '+%Y-%m-%dT%H:%M:%SZ'
 }
 
-test_existing_valid_key_exits_early() {
+iso_minutes_ago() {
+    local minutes="$1"
+    date -u --date="${minutes} minutes ago" '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+test_existing_valid_key_refreshes_timeout_and_exits_early() {
     printf '101\n' > "${STATE_DIR}/existing_key_id"
     printf 'valid-existing-key' > "${STATE_DIR}/existing_key_value"
     touch "${STATE_DIR}/unlock_check_ok"
 
-    invoke_sess "${MOCK_BIN}:${PATH}"
+    BW_SESSION_TIMEOUT=1200 invoke_sess "${MOCK_BIN}:${PATH}"
     local calls
     calls="$(cat "${STATE_DIR}/calls.log")"
 
     assert_eq "0" "${RC}" "exit code"
     assert_eq "valid-existing-key" "$(cat "${STATE_DIR}/unlock_check_session")" "unlock --check received piped key"
+    assert_eq "101 1200" "$(cat "${STATE_DIR}/timeout.log")" "existing key timeout refreshed"
     assert_not_contains "${calls}" "bw-wrapper" "must not call bw wrapper"
     assert_not_contains "${calls}" "bw.bin login" "must not call login"
     assert_not_contains "${calls}" "bw.bin unlock --raw" "must not call unlock --raw"
     assert_not_contains "${calls}" "keyctl padd" "must not call keyctl padd"
     assert_not_contains "${calls}" "bw.bin sync" "must not call sync"
+}
+
+test_existing_key_timeout_refresh_failure_reauthenticates() {
+    printf '101\n' > "${STATE_DIR}/existing_key_id"
+    printf 'valid-existing-key' > "${STATE_DIR}/existing_key_value"
+    touch "${STATE_DIR}/unlock_check_ok"
+    touch "${STATE_DIR}/keyctl_timeout_fail_once"
+    printf 'reauth-after-timeout' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "exit code"
+    assert_eq "101" "$(cat "${STATE_DIR}/revoke.log")" "revoked key after timeout refresh failure"
+    assert_eq "101 @u" "$(cat "${STATE_DIR}/unlink.log")" "unlinked key after timeout refresh failure"
+    assert_eq "reauth-after-timeout" "$(cat "${STATE_DIR}/padd_stdin")" "stored fresh session key"
+}
+
+test_existing_key_empty_or_failed_pipe_reauthenticates() {
+    # Empty pipe output triggers stale cleanup and re-authentication.
+    printf '102\n' > "${STATE_DIR}/existing_key_id"
+    : > "${STATE_DIR}/existing_key_value"
+    printf 'recovered-from-empty-pipe' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "exit code on empty pipe"
+    assert_eq "102" "$(cat "${STATE_DIR}/revoke.log")" "revoked empty-pipe key"
+    assert_eq "102 @u" "$(cat "${STATE_DIR}/unlink.log")" "unlinked empty-pipe key"
+    assert_eq "recovered-from-empty-pipe" "$(cat "${STATE_DIR}/padd_stdin")" "stored new key"
+
+    # Failing keyctl pipe triggers stale cleanup and re-authentication.
+    setup_env
+    printf '103\n' > "${STATE_DIR}/existing_key_id"
+    touch "${STATE_DIR}/keyctl_pipe_fail"
+    printf 'recovered-from-failed-pipe' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "exit code on failed pipe"
+    assert_eq "103" "$(cat "${STATE_DIR}/revoke.log")" "revoked failed-pipe key"
+    assert_eq "103 @u" "$(cat "${STATE_DIR}/unlink.log")" "unlinked failed-pipe key"
+    assert_eq "recovered-from-failed-pipe" "$(cat "${STATE_DIR}/padd_stdin")" "stored new key after pipe fail"
 }
 
 test_stale_keyring_key_triggers_reauth() {
@@ -249,7 +338,7 @@ test_stale_keyring_key_triggers_reauth() {
     assert_eq "101 @u" "$(cat "${STATE_DIR}/unlink.log")" "unlinked stale key"
     assert_contains "${calls}" "bw.bin unlock --raw" "re-unlocked vault"
     assert_eq "fresh-key-after-stale" "$(cat "${STATE_DIR}/padd_stdin")" "stored new key"
-    assert_eq "54321 0x3f000000" "$(cat "${STATE_DIR}/setperm.log")" "setperm called"
+    assert_eq "54321 0x3f3f0000" "$(cat "${STATE_DIR}/setperm.log")" "setperm on @u uses 0x3f3f0000"
     assert_eq "54321 900" "$(cat "${STATE_DIR}/timeout.log")" "timeout set"
 }
 
@@ -273,23 +362,194 @@ test_already_logged_in_stores_exact_bytes_without_newline() {
     calls="$(cat "${STATE_DIR}/calls.log")"
 
     assert_eq "0" "${RC}" "exit code"
-    assert_not_contains "${calls}" "bw.bin login"$'\n' "skipped bw.bin login"
+    assert_not_contains "${calls}" "bw.bin login --raw" "skipped bw.bin login --raw"
     assert_eq "16" "$(wc -c < "${STATE_DIR}/padd_stdin" | tr -d ' ')" "exact byte count without trailing newline"
     assert_eq "exactKeyBytes123" "$(cat "${STATE_DIR}/padd_stdin")" "exact stored bytes"
     assert_eq "54321 900" "$(cat "${STATE_DIR}/timeout.log")" "default timeout"
 }
 
-test_not_logged_in_runs_login_redirected_to_stderr() {
+test_not_logged_in_uses_login_raw_without_leak_or_double_prompt() {
     touch "${STATE_DIR}/login_check_fail"
-    printf 'Login prompt text\n' > "${STATE_DIR}/login_stdout"
-    printf 'unlocked-key-42' > "${STATE_DIR}/unlock_raw_key"
+    printf 'Email prompt on stderr\n' > "${STATE_DIR}/login_stderr"
+    printf 'secret-login-raw-token' > "${STATE_DIR}/login_raw_key"
     iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
 
     invoke_sess "${MOCK_BIN}:${PATH}"
+    local calls
+    calls="$(cat "${STATE_DIR}/calls.log")"
+
     assert_eq "0" "${RC}" "exit code"
-    assert_eq "" "${STDOUT}" "login stdout must not appear on stdout"
-    assert_contains "${STDERR}" "Login prompt text" "login stdout redirected to stderr"
-    assert_eq "unlocked-key-42" "$(cat "${STATE_DIR}/padd_stdin")" "stored unlocked key"
+    assert_eq "" "${STDOUT}" "stdout must stay empty"
+    assert_not_contains "${STDERR}" "secret-login-raw-token" "secret token must not leak to stderr"
+    assert_contains "${STDERR}" "Email prompt on stderr" "interactive stderr prompt passes through"
+    assert_contains "${calls}" "bw.bin login --raw" "used bw.bin login --raw"
+    assert_not_contains "${calls}" "bw.bin unlock --raw" "must not call redundant unlock --raw"
+    assert_eq "secret-login-raw-token" "$(cat "${STATE_DIR}/padd_stdin")" "stored raw login key"
+
+    # Empty login --raw output must exit 1.
+    setup_env
+    touch "${STATE_DIR}/login_check_fail"
+    : > "${STATE_DIR}/login_raw_key"
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "1" "${RC}" "empty login --raw exits 1"
+    assert_contains "${STDERR}" "login failed" "stderr mentions login failure"
+}
+
+test_stdin_isolation_never_consumes_piped_secrets() {
+    # Unlock path with piped stdin under setsid (no controlling tty -> /dev/null).
+    touch "${STATE_DIR}/capture_stdin"
+    printf '101\n' > "${STATE_DIR}/existing_key_id"
+    printf 'stale-key' > "${STATE_DIR}/existing_key_value"
+    printf 'unlocked-key-isolated' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    RC=0
+    printf 'piped-secret-payload\n' | setsid -w env MOCK_STATE_DIR="${STATE_DIR}" PATH="${MOCK_BIN}:${PATH}" \
+        "${BASH}" "${BW_SESS}" >"${TEST_DIR}/stdout" 2>"${TEST_DIR}/stderr" || RC=$?
+    assert_eq "0" "${RC}" "unlock path exit code with piped stdin"
+    assert_eq "" "$(cat "${STATE_DIR}/unlock_check_stdin")" "unlock --check must not read piped stdin"
+    assert_eq "" "$(cat "${STATE_DIR}/login_check_stdin")" "login --check must not read piped stdin"
+    assert_eq "" "$(cat "${STATE_DIR}/unlock_raw_stdin")" "unlock --raw must not read piped stdin"
+
+    # Login path with piped stdin.
+    setup_env
+    touch "${STATE_DIR}/capture_stdin"
+    touch "${STATE_DIR}/login_check_fail"
+    printf 'login-key-isolated' > "${STATE_DIR}/login_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    RC=0
+    printf 'piped-secret-payload\n' | setsid -w env MOCK_STATE_DIR="${STATE_DIR}" PATH="${MOCK_BIN}:${PATH}" \
+        "${BASH}" "${BW_SESS}" >"${TEST_DIR}/stdout" 2>"${TEST_DIR}/stderr" || RC=$?
+    assert_eq "0" "${RC}" "login path exit code with piped stdin"
+    assert_eq "" "$(cat "${STATE_DIR}/login_check_stdin")" "login --check must not read piped stdin"
+    assert_eq "" "$(cat "${STATE_DIR}/login_raw_stdin")" "login --raw must not read piped stdin"
+}
+
+test_inherited_bw_session_is_unset() {
+    printf 'fresh-token-clean' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    BW_SESSION="poison-inherited-token" invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "exit code"
+    assert_eq "" "$(cat "${STATE_DIR}/login_check_session")" "login --check must not inherit BW_SESSION"
+    assert_eq "" "$(cat "${STATE_DIR}/unlock_raw_session")" "unlock --raw must not inherit BW_SESSION"
+}
+
+test_keyring_permission_masks_for_user_and_session_rings() {
+    # @u uses 0x3f3f0000 (possessor + owner UID).
+    printf 'user-ring-key' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    BW_KEYRING="@u" invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "exit code for @u"
+    assert_eq "54321 0x3f3f0000" "$(cat "${STATE_DIR}/setperm.log")" "@u permission mask"
+
+    # @s uses 0x3f000000 (possessor only).
+    setup_env
+    printf 'session-ring-key' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+    BW_KEYRING="@s" invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "exit code for @s"
+    assert_eq "54321 0x3f000000" "$(cat "${STATE_DIR}/setperm.log")" "@s permission mask"
+}
+
+test_signals_during_setup_cleanup_key_and_return_signal_code() {
+    local spec sig expected_rc pid rc
+    for spec in "INT:130" "TERM:143" "HUP:129"; do
+        sig="${spec%%:*}"
+        expected_rc="${spec##*:}"
+        setup_env
+        printf 'sig-setup-key' > "${STATE_DIR}/unlock_raw_key"
+        touch "${STATE_DIR}/pause_in_setperm"
+        iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+
+        MOCK_STATE_DIR="${STATE_DIR}" PATH="${MOCK_BIN}:${PATH}" \
+            perl -e '$SIG{INT}="DEFAULT"; $SIG{TERM}="DEFAULT"; $SIG{HUP}="DEFAULT"; exec @ARGV' \
+            "${BASH}" "${BW_SESS}" >"${TEST_DIR}/stdout" 2>"${TEST_DIR}/stderr" &
+        pid=$!
+
+        local tries=0
+        while [[ ! -f "${STATE_DIR}/setperm_ready" && "${tries}" -lt 100 ]]; do
+            sleep 0.02
+            tries=$((tries + 1))
+        done
+        if [[ ! -f "${STATE_DIR}/setperm_ready" ]]; then
+            echo "Assertion failed: setperm did not reach ready state for SIG${sig}." >&2
+            return 1
+        fi
+
+        kill "-${sig}" "${pid}"
+        rc=0
+        wait "${pid}" || rc=$?
+
+        assert_eq "${expected_rc}" "${rc}" "exit code on SIG${sig} during setup"
+        assert_eq "54321" "$(cat "${STATE_DIR}/revoke.log")" "key revoked on SIG${sig} during setup"
+        assert_eq "54321 @u" "$(cat "${STATE_DIR}/unlink.log")" "key unlinked on SIG${sig} during setup"
+    done
+}
+
+test_signals_during_sync_keep_valid_key_and_return_signal_code() {
+    local spec sig expected_rc pid rc
+    for spec in "INT:130" "TERM:143" "HUP:129"; do
+        sig="${spec%%:*}"
+        expected_rc="${spec##*:}"
+        setup_env
+        printf 'sig-sync-key' > "${STATE_DIR}/unlock_raw_key"
+        iso_hours_ago 10 > "${STATE_DIR}/sync_last_value"
+        touch "${STATE_DIR}/pause_in_sync"
+
+        MOCK_STATE_DIR="${STATE_DIR}" PATH="${MOCK_BIN}:${PATH}" \
+            perl -e '$SIG{INT}="DEFAULT"; $SIG{TERM}="DEFAULT"; $SIG{HUP}="DEFAULT"; exec @ARGV' \
+            "${BASH}" "${BW_SESS}" >"${TEST_DIR}/stdout" 2>"${TEST_DIR}/stderr" &
+        pid=$!
+
+        local tries=0
+        while [[ ! -f "${STATE_DIR}/sync_ready" && "${tries}" -lt 100 ]]; do
+            sleep 0.02
+            tries=$((tries + 1))
+        done
+        if [[ ! -f "${STATE_DIR}/sync_ready" ]]; then
+            echo "Assertion failed: sync did not reach ready state for SIG${sig}." >&2
+            return 1
+        fi
+
+        kill "-${sig}" "${pid}"
+        rc=0
+        wait "${pid}" || rc=$?
+
+        assert_eq "${expected_rc}" "${rc}" "exit code on SIG${sig} during sync"
+        if [[ -f "${STATE_DIR}/revoke.log" || -f "${STATE_DIR}/unlink.log" ]]; then
+            echo "Assertion failed: valid key must not be revoked on SIG${sig} during sync." >&2
+            return 1
+        fi
+    done
+}
+
+test_sync_eight_hour_boundaries_and_future_clock_skew() {
+    # 7 hours 59 minutes ago skips sync.
+    printf 'key-7h59m' > "${STATE_DIR}/unlock_raw_key"
+    iso_minutes_ago 479 > "${STATE_DIR}/sync_last_value"
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "7h59m exit code"
+    assert_not_contains "$(cat "${STATE_DIR}/calls.log")" "bw.bin sync"$'\n' "7h59m skips sync"
+
+    # 8 hours 1 minute ago triggers sync.
+    setup_env
+    printf 'key-8h01m' > "${STATE_DIR}/unlock_raw_key"
+    iso_minutes_ago 481 > "${STATE_DIR}/sync_last_value"
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "8h01m exit code"
+    assert_eq "key-8h01m" "$(cat "${STATE_DIR}/sync_session")" "8h01m triggers sync"
+
+    # Future clock skew (1 hour ahead) skips sync without crashing.
+    setup_env
+    printf 'key-future' > "${STATE_DIR}/unlock_raw_key"
+    date -u --date="1 hour" '+%Y-%m-%dT%H:%M:%SZ' > "${STATE_DIR}/sync_last_value"
+    invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "future timestamp exit code"
+    assert_not_contains "$(cat "${STATE_DIR}/calls.log")" "bw.bin sync"$'\n' "future timestamp skips sync"
 }
 
 test_recent_sync_skips_sync() {
@@ -456,21 +716,35 @@ test_invalid_timeout_exits_one() {
     done
 }
 
-test_custom_timeout_passed_to_keyctl() {
+test_boundary_timeouts_and_empty_env_vars() {
+    printf 'min-timeout-key' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+    BW_SESSION_TIMEOUT=1 invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "min timeout exit code"
+    assert_eq "54321 1" "$(cat "${STATE_DIR}/timeout.log")" "min timeout"
+
+    setup_env
     printf 'custom-timeout-key' > "${STATE_DIR}/unlock_raw_key"
     iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
-
     BW_SESSION_TIMEOUT=1800 invoke_sess "${MOCK_BIN}:${PATH}"
-    assert_eq "0" "${RC}" "exit code"
+    assert_eq "0" "${RC}" "custom timeout exit code"
     assert_eq "54321 1800" "$(cat "${STATE_DIR}/timeout.log")" "custom timeout"
 
     setup_env
     printf 'max-timeout-key' > "${STATE_DIR}/unlock_raw_key"
     iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
-
     BW_SESSION_TIMEOUT=86400 invoke_sess "${MOCK_BIN}:${PATH}"
     assert_eq "0" "${RC}" "max timeout exit code"
     assert_eq "54321 86400" "$(cat "${STATE_DIR}/timeout.log")" "max timeout"
+
+    setup_env
+    printf 'empty-env-key' > "${STATE_DIR}/unlock_raw_key"
+    iso_hours_ago 1 > "${STATE_DIR}/sync_last_value"
+    BW_SESSION_TIMEOUT="" BW_KEYRING="" invoke_sess "${MOCK_BIN}:${PATH}"
+    assert_eq "0" "${RC}" "empty env vars exit code"
+    assert_eq "54321 900" "$(cat "${STATE_DIR}/timeout.log")" "empty timeout defaults to 900"
+    assert_eq "54321 0x3f3f0000" "$(cat "${STATE_DIR}/setperm.log")" "empty keyring defaults to @u"
+    assert_contains "$(cat "${STATE_DIR}/calls.log")" "keyctl padd user bw_session @u" "padd targets @u"
 }
 
 test_keyring_option_validation() {
@@ -505,11 +779,19 @@ test_missing_keyctl_or_bw_bin() {
     assert_contains "${STDERR}" "bw.bin" "stderr mentions bw.bin"
 }
 
-run_case "existing valid key exits early without login/unlock/padd/sync" test_existing_valid_key_exits_early
+run_case "existing valid key refreshes timeout and exits early" test_existing_valid_key_refreshes_timeout_and_exits_early
+run_case "existing key re-authenticates when timeout refresh fails" test_existing_key_timeout_refresh_failure_reauthenticates
+run_case "existing key re-authenticates when keyctl pipe is empty or fails" test_existing_key_empty_or_failed_pipe_reauthenticates
 run_case "stale keyring key triggers re-authentication" test_stale_keyring_key_triggers_reauth
 run_case "stale keyring key is revoked and unlinked even if re-unlock fails" test_stale_key_revoked_even_when_reunlock_fails
 run_case "already logged in skips login and stores exact bytes" test_already_logged_in_stores_exact_bytes_without_newline
-run_case "not logged in runs login with stdout redirected to stderr" test_not_logged_in_runs_login_redirected_to_stderr
+run_case "not logged in runs login --raw without leak or double prompt" test_not_logged_in_uses_login_raw_without_leak_or_double_prompt
+run_case "stdin isolation never consumes piped data" test_stdin_isolation_never_consumes_piped_secrets
+run_case "inherited BW_SESSION is unset before authentication" test_inherited_bw_session_is_unset
+run_case "keyring permissions use 0x3f3f0000 for @u and 0x3f000000 for @s" test_keyring_permission_masks_for_user_and_session_rings
+run_case "SIGINT, SIGTERM, and SIGHUP during setup revoke key and return signal code" test_signals_during_setup_cleanup_key_and_return_signal_code
+run_case "SIGINT, SIGTERM, and SIGHUP during sync keep key and return signal code" test_signals_during_sync_keep_valid_key_and_return_signal_code
+run_case "sync honors 7h59m, 8h01m, and future clock skew boundaries" test_sync_eight_hour_boundaries_and_future_clock_skew
 run_case "last sync under 8 hours skips sync" test_recent_sync_skips_sync
 run_case "last sync over 8 hours runs sync with new BW_SESSION" test_old_sync_triggers_sync_with_new_key
 run_case "empty sync --last output triggers sync" test_sync_last_empty_triggers_sync
@@ -521,13 +803,13 @@ run_case "bw.bin login failure exits 1" test_login_failure_exits_one
 run_case "bw.bin unlock --raw failure exits 2" test_unlock_failure_exits_two
 run_case "bw.bin unlock --raw empty output exits 2" test_unlock_empty_key_exits_two
 run_case "keys starting with -n or -e are stored verbatim" test_key_starting_with_dash_n_and_dash_e_stored_verbatim
-run_case "keyctl padd failure exits non-zero" test_keyctl_padd_fails_exits_nonzero
-run_case "keyctl padd empty ID exits non-zero" test_keyctl_padd_empty_id_exits_nonzero
+run_case "keyctl padd failure exits 1" test_keyctl_padd_fails_exits_nonzero
+run_case "keyctl padd empty ID exits 1" test_keyctl_padd_empty_id_exits_nonzero
 run_case "keyctl setperm failure revokes and unlinks key and exits 1" test_keyctl_setperm_fails_revokes_and_unlinks_key
-run_case "keyctl timeout failure unlinks key and exits non-zero" test_keyctl_timeout_fails_unlinks_key
+run_case "keyctl timeout failure revokes and unlinks key and exits 1" test_keyctl_timeout_fails_unlinks_key
 run_case "unexpected CLI args exit 1 with usage" test_unexpected_cli_args_exits_one
 run_case "invalid BW_SESSION_TIMEOUT exits 1" test_invalid_timeout_exits_one
-run_case "custom BW_SESSION_TIMEOUT is passed to keyctl" test_custom_timeout_passed_to_keyctl
+run_case "boundary BW_SESSION_TIMEOUT and empty environment variables work" test_boundary_timeouts_and_empty_env_vars
 run_case "BW_KEYRING accepts @s and rejects invalid values" test_keyring_option_validation
 run_case "missing keyctl or bw.bin in PATH exits 1" test_missing_keyctl_or_bw_bin
 

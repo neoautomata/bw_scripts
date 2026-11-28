@@ -14,4 +14,9 @@ if [[ ! "${itemID}" =~ ${UUID_REGEX} ]]; then
     exit 1
 fi
 
+if ! command -v bw >/dev/null 2>&1; then
+    echo "Error: bw is not in PATH." >&2
+    exit 1
+fi
+
 exec bw get item -- "${itemID}"

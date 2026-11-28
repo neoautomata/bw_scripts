@@ -3,25 +3,69 @@
 set -euo pipefail
 
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+ATTACHMENT_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 is_valid_uuid() {
   [[ "${1}" =~ ${UUID_RE} ]]
 }
 
+is_valid_attachment_id() {
+  [[ "${1}" =~ ${ATTACHMENT_ID_RE} ]]
+}
+
+strip_trailing_slashes() {
+  local path="${1}"
+  while [[ "${path}" != "/" && "${path}" == */ ]]; do
+    path="${path%/}"
+  done
+  printf '%s\n' "${path}"
+}
+
 is_valid_runtime_dir() {
-  local dir="$1"
-  local require_owner="$2"
+  local dir
+  dir="$(strip_trailing_slashes "${1}")"
+  local require_owner="${2}"
+  local ancestor=""
+  local dir_uid=""
   local fs_type=""
 
   if [[ "${dir}" != /* ]]; then
     return 1
   fi
-  if [[ -L "${dir}" || ! -d "${dir}" || ! -w "${dir}" ]]; then
+  if [[ "${dir}/" == *"/../"* || "${dir}/" == *"/./"* ]]; then
     return 1
   fi
-  if [[ "${require_owner}" -eq 1 && ! -O "${dir}" ]]; then
+
+  # Reject symlinks on the target directory and every ancestor component.
+  ancestor="${dir}"
+  while [[ "${ancestor}" != "/" && -n "${ancestor}" ]]; do
+    if [[ -L "${ancestor}" ]]; then
+      return 1
+    fi
+    ancestor="${ancestor%/*}"
+    if [[ -z "${ancestor}" ]]; then
+      ancestor="/"
+    fi
+  done
+  if [[ -L "/" ]]; then
     return 1
   fi
+
+  if [[ ! -d "${dir}" || ! -w "${dir}" ]]; then
+    return 1
+  fi
+
+  if [[ "${require_owner}" -eq 1 ]]; then
+    if [[ ! -O "${dir}" ]]; then
+      return 1
+    fi
+  else
+    dir_uid="$(stat -c '%u' "${dir}" 2>/dev/null || true)"
+    if [[ ! -k "${dir}" || "${dir_uid}" != "0" ]]; then
+      return 1
+    fi
+  fi
+
   fs_type="$(stat -f -c '%T' "${dir}" 2>/dev/null || true)"
   if [[ "${fs_type}" != "tmpfs" && "${fs_type}" != "ramfs" ]]; then
     return 1
@@ -29,9 +73,56 @@ is_valid_runtime_dir() {
   return 0
 }
 
+is_info_ssh_invocation() {
+  local arg rest char i len
+
+  while [[ $# -gt 0 ]]; do
+    arg="${1}"
+    shift
+
+    if [[ "${arg}" == "--" ]]; then
+      return 1
+    fi
+
+    if [[ "${arg}" != -* || "${arg}" == "-" ]]; then
+      return 1
+    fi
+
+    rest="${arg:1}"
+    len="${#rest}"
+    i=0
+    while [[ "${i}" -lt "${len}" ]]; do
+      char="${rest:${i}:1}"
+      case "${char}" in
+        V|Q|G)
+          return 0
+          ;;
+        B|b|c|D|E|e|F|I|i|J|L|l|m|O|o|P|p|R|S|W|w)
+          if [[ $((i + 1)) -lt "${len}" ]]; then
+            break
+          fi
+          if [[ $# -gt 0 ]]; then
+            shift
+          fi
+          break
+          ;;
+        *)
+          i=$((i + 1))
+          ;;
+      esac
+    done
+  done
+  return 1
+}
+
 if [[ $# -eq 0 ]]; then
-  echo "Usage: bw.ssh <ssh-options> <destination> [command]" >&2
+  echo "Usage: bw.ssh [ssh-options] <destination> [command]" >&2
   exit 1
+fi
+
+# Pass informational SSH invocations directly to ssh without vault access.
+if is_info_ssh_invocation "$@"; then
+  exec ssh "$@"
 fi
 
 if ! bw.sess; then
@@ -45,14 +136,12 @@ if ! cfg="$(ssh -G "$@")"; then
 fi
 
 user="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "user" {print $2; exit}')"
-host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "host" {print $2; exit}')"
-if [[ -z "${host}" ]]; then
-  host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "hostname" {print $2; exit}')"
-fi
+host="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "hostname" {print $2; exit}')"
+proxyjump="$(printf '%s\n' "${cfg}" | awk 'tolower($1) == "proxyjump" {print $2; exit}')"
 unset cfg
 
 if [[ -z "${user}" || -z "${host}" ]]; then
-  echo "Error: SSH configuration lacks user or host." >&2
+  echo "Error: ssh -G did not return user or hostname." >&2
   exit 1
 fi
 
@@ -62,18 +151,19 @@ tmp_dir=""
 agent_started=0
 # shellcheck disable=SC2317
 cleanup() {
-  if [[ "${agent_started}" -eq 1 ]]; then
+  if [[ "${agent_started}" -eq 1 && -n "${SSH_AGENT_PID:-}" ]]; then
     ssh-agent -k >/dev/null 2>&1 || true
     agent_started=0
   fi
   if [[ -n "${tmp_dir}" && -d "${tmp_dir}" ]]; then
     rm -rf -- "${tmp_dir}"
+    tmp_dir=""
   fi
 }
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
-trap 'cleanup; exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 search_rc=0
 itemID="$(bw.item.search "${query}")" || search_rc=$?
@@ -90,24 +180,44 @@ privkeyID="$(bw.item.privKeyID "${itemID}" "${query}")" || key_rc=$?
 
 case "${key_rc}" in
   0)
-    if ! is_valid_uuid "${privkeyID}"; then
-      echo "Error: Private key lookup returned an invalid UUID for ${query}." >&2
+    if ! is_valid_attachment_id "${privkeyID}"; then
+      echo "Error: Private key search returned an invalid attachment ID for ${query}." >&2
       exit 1
     fi
 
-    # Start an isolated ssh-agent so keys do not leak into a shared agent.
+    # Clear outer agent variables so cleanup never stops a caller ssh-agent.
+    unset SSH_AUTH_SOCK SSH_AGENT_PID
     if ! agent_env="$(ssh-agent -s)"; then
       echo "Error: Cannot start ssh-agent." >&2
       exit 1
     fi
     eval "${agent_env}" >/dev/null
+    unset agent_env
+    if [[ -z "${SSH_AUTH_SOCK:-}" || -z "${SSH_AGENT_PID:-}" ]]; then
+      echo "Error: ssh-agent did not set SSH_AUTH_SOCK and SSH_AGENT_PID." >&2
+      exit 1
+    fi
     agent_started=1
 
+    priv_key=""
+    if ! priv_key="$(bw get attachment "${privkeyID}" --itemid "${itemID}" --raw)"; then
+      unset priv_key
+      echo "Error: Cannot read private key attachment for ${query}." >&2
+      exit 1
+    fi
+    if [[ -z "${priv_key//[[:space:]]/}" ]]; then
+      unset priv_key
+      echo "Error: Private key attachment is empty for ${query}." >&2
+      exit 1
+    fi
+
     # Load the private key into the isolated ssh-agent for 15 seconds.
-    if ! bw get attachment "${privkeyID}" --itemid "${itemID}" --raw | ssh-add -t 15 - >/dev/null; then
+    if ! printf '%s\n' "${priv_key}" | ssh-add -t 15 - >/dev/null; then
+      unset priv_key
       echo "Error: Cannot load private key into ssh-agent." >&2
       exit 1
     fi
+    unset priv_key
 
     # Run ssh without exec so the EXIT trap stops the isolated ssh-agent.
     ssh_rc=0
@@ -115,12 +225,29 @@ case "${key_rc}" in
     exit "${ssh_rc}"
     ;;
   2)
-    if ! pw="$(bw.item.pass "${itemID}")"; then
-      echo "Error: Cannot fetch password for ${query}." >&2
+    if [[ -n "${proxyjump}" && "${proxyjump,,}" != "none" ]]; then
+      echo "Error: Password authentication does not allow ProxyJump for ${query}." >&2
       exit 1
     fi
 
-    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    pass_rc=0
+    pw="$(bw.item.pass "${itemID}")" || pass_rc=$?
+    if [[ "${pass_rc}" -ne 0 ]]; then
+      unset pw
+      if [[ "${pass_rc}" -eq 2 ]]; then
+        echo "Error: Password is missing for ${query}." >&2
+      else
+        echo "Error: Cannot read password for ${query}." >&2
+      fi
+      exit 1
+    fi
+    if [[ -z "${pw}" || "${pw}" == *$'\n'* || "${pw}" == *$'\r'* ]]; then
+      unset pw
+      echo "Error: Password for ${query} is empty or contains a line break." >&2
+      exit 1
+    fi
+
+    runtime_dir="$(strip_trailing_slashes "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")"
     if ! is_valid_runtime_dir "${runtime_dir}" 1; then
       if is_valid_runtime_dir "/dev/shm" 0; then
         runtime_dir="/dev/shm"
@@ -133,7 +260,7 @@ case "${key_rc}" in
 
     old_umask="$(umask)"
     umask 077
-    tmp_dir="$(mktemp -d -p "${runtime_dir}" bw_ssh.XXXXXXXXXX)"
+    tmp_dir="$(mktemp -d "${runtime_dir}/bw_ssh.XXXXXXXXXX")"
     pass_file="${tmp_dir}/pass"
     printf '%s\n' "${pw}" > "${pass_file}"
     chmod 600 "${pass_file}"
@@ -144,13 +271,45 @@ case "${key_rc}" in
     cat > "${askpass_script}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-case "\${1:-}" in
-  *[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]*|*[Pp][Aa][Ss][Ss][Cc][Oo][Dd][Ee]*)
-    exec 3< ${pass_file_q} 2>/dev/null || exit 1
-    rm -f -- ${pass_file_q}
+pass_file=${pass_file_q}
+EOF
+    cat >> "${askpass_script}" <<'EOF'
+prompt="${1:-}"
+if [[ -z "${prompt}" ]]; then
+  exit 1
+fi
+prompt_lc="${prompt,,}"
+if [[ "${prompt_lc}" == *passphrase* ]]; then
+  exit 1
+fi
+prefix_re="^[^[:space:]:]+@[^[:space:]:]+'s[[:space:]]+(.*)$"
+if [[ "${prompt_lc}" =~ ${prefix_re} ]]; then
+  prompt_body="${BASH_REMATCH[1]}"
+else
+  prompt_body="${prompt_lc}"
+fi
+key_word_re='(^|[^a-z0-9])key([^a-z0-9]|$)'
+case "${prompt_body}" in
+  *password*|*passcode*)
+    if [[ "${prompt_body}" =~ ${key_word_re} ]]; then
+      exit 1
+    fi
+    claim="${pass_file}.$$"
+    mv -- "${pass_file}" "${claim}" 2>/dev/null || exit 1
+    exec 3< "${claim}" 2>/dev/null || { rm -f -- "${claim}"; exit 1; }
+    rm -f -- "${claim}"
     exec cat <&3
     ;;
   *)
+    if { exec 4<>/dev/tty; } 2>/dev/null; then
+      printf '%s' "${prompt}" >&4 || { exec 4<&- 4>&-; exit 1; }
+      if IFS= read -r reply <&4; then
+        exec 4<&- 4>&-
+        printf '%s\n' "${reply}"
+        exit 0
+      fi
+      exec 4<&- 4>&-
+    fi
     exit 1
     ;;
 esac
@@ -160,15 +319,15 @@ EOF
 
     echo "Using password authentication for ${query}." >&2
 
-    # Run ssh without exec so the EXIT trap removes tmp_dir.
-    # Disable ControlMaster so background multiplexers do not inherit SSH_ASKPASS.
+    # Run ssh without exec so the EXIT trap deletes tmp_dir.
+    # Disable public key auth and multiplexing so SSH_ASKPASS never leaks.
     ssh_rc=0
-    env SSH_ASKPASS="${askpass_script}" SSH_ASKPASS_REQUIRE='force' \
-      ssh -o ControlMaster=no -o ControlPersist=no "$@" || ssh_rc=$?
+    env -u SSH_AUTH_SOCK SSH_ASKPASS="${askpass_script}" SSH_ASKPASS_REQUIRE='force' \
+      ssh -o PubkeyAuthentication=no -o ControlMaster=no -o ControlPersist=no -o ControlPath=none "$@" || ssh_rc=$?
     exit "${ssh_rc}"
     ;;
   *)
-    echo "Error: Private key lookup failed for ${query}." >&2
+    echo "Error: Private key search failed for ${query}." >&2
     exit "${key_rc}"
     ;;
 esac

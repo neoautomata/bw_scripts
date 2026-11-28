@@ -16,12 +16,29 @@ if [[ ! "${itemID}" =~ ${UUID_REGEX} ]]; then
     exit 1
 fi
 
+if ! command -v bw.item.get >/dev/null 2>&1; then
+    echo "Error: bw.item.get is not in PATH." >&2
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is not in PATH." >&2
+    exit 1
+fi
+
 if ! itemJSON="$(bw.item.get "${itemID}")" || [[ -z "$itemJSON" ]]; then
     echo "Error: Bitwarden failed to read item ${itemID}." >&2
     exit 1
 fi
 
-if ! cnt="$(printf '%s' "${itemJSON}" | jq -r --arg name "${name}" '[.fields[]? | select(type == "object" and .name == $name)] | length')"; then
+# Check the item structure and collect fields that match the requested name.
+# shellcheck disable=SC2016
+JQ_FIELDS='if type != "object" then error("expected object")
+elif (.fields | type) != "null" and (.fields | type) != "array" then error("expected array or null fields")
+else [(.fields // [])[] | select(type == "object" and .name == $name)]
+end'
+
+if ! cnt="$(printf '%s' "${itemJSON}" | jq -r --arg name "${name}" "(${JQ_FIELDS}) | length")"; then
     echo "Error: jq failed to parse item ${itemID}." >&2
     exit 1
 fi
@@ -37,11 +54,11 @@ if [[ "${cnt}" -eq 0 ]]; then
 fi
 
 if [[ "${cnt}" -gt 1 ]]; then
-    echo "Error: Item ${itemID} has ${cnt} fields named ${name}. Expected 1." >&2
+    echo "Error: Item ${itemID} has ${cnt} fields named ${name}. The script requires 1 match." >&2
     exit 3
 fi
 
-if ! printf '%s' "${itemJSON}" | jq -r --arg name "${name}" '.fields[]? | select(type == "object" and .name == $name) | if .value == null then "" else (.value | tostring) end'; then
+if ! printf '%s' "${itemJSON}" | jq -r --arg name "${name}" "(${JQ_FIELDS})[0] | if .value == null then \"\" else (.value | tostring) end"; then
     echo "Error: jq failed to read field ${name}." >&2
     exit 1
 fi

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${_BW_WRAPPER_ACTIVE:-0}" == "1" ]]; then
+    echo "Error: bw detected a recursive bw.bin call." >&2
+    exit 1
+fi
+
 TIMEOUT="${BW_SESSION_TIMEOUT:-900}"
 if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]*$ || ${#TIMEOUT} -gt 5 || "$TIMEOUT" -gt 86400 ]]; then
     echo "Error: BW_SESSION_TIMEOUT must be an integer from 1 to 86400." >&2
@@ -18,36 +23,120 @@ if ! command -v keyctl >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v bw.bin >/dev/null 2>&1; then
+if ! bw_bin_path="$(command -v bw.bin 2>/dev/null)" || [[ -z "${bw_bin_path}" ]]; then
     echo "Error: bw.bin is not in PATH." >&2
     exit 1
 fi
 
-# Handle subcommands that must revoke or bypass the cached session key.
-case "${1:-}" in
+if [[ "${bw_bin_path}" -ef "${BASH_SOURCE[0]}" ]]; then
+    echo "Error: bw.bin points to this bw script." >&2
+    exit 1
+fi
+
+run_bw_bin() {
+    export _BW_WRAPPER_ACTIVE=1
+    exec "${bw_bin_path}" "$@"
+}
+
+run_bw_sess() {
+    local sess_rc=0
+    if ! command -v bw.sess >/dev/null 2>&1; then
+        echo "Error: bw.sess is not in PATH." >&2
+        exit 1
+    fi
+    bw.sess || sess_rc=$?
+    if [[ "${sess_rc}" -ne 0 ]]; then
+        echo "Error: bw.sess failed with exit code ${sess_rc}." >&2
+        exit "${sess_rc}"
+    fi
+}
+
+# Scan arguments without modifying them to find the subcommand and flags.
+subcommand=""
+has_help_or_version=0
+has_explicit_session=0
+
+if [[ $# -gt 0 ]]; then
+    args=("$@")
+    idx=0
+    argc="${#args[@]}"
+    while (( idx < argc )); do
+        arg="${args[${idx}]}"
+        case "${arg}" in
+            --)
+                if [[ -z "${subcommand}" ]] && (( idx + 1 < argc )); then
+                    subcommand="${args[$((idx + 1))]}"
+                fi
+                break
+                ;;
+            --pretty|--raw|--response|--cleanexit|--quiet|--nointeraction)
+                idx=$((idx + 1))
+                ;;
+            --session)
+                has_explicit_session=1
+                idx=$((idx + 2))
+                ;;
+            --session=*)
+                has_explicit_session=1
+                idx=$((idx + 1))
+                ;;
+            -h|--help)
+                has_help_or_version=1
+                idx=$((idx + 1))
+                ;;
+            -v|--version)
+                if [[ -z "${subcommand}" ]]; then
+                    has_help_or_version=1
+                fi
+                idx=$((idx + 1))
+                ;;
+            --search|--url|--folderid|--collectionid|--organizationid|--itemid|--output|--file|--format|--password|--passwordenv|--passwordfile|--method|--code|--name|--notes|--deleteInDays|--expiresInDays|--maxAccessCount|--hostname|--port|--length|--minNumber|--minSpecial|--words|--separator|-f|-d|-a)
+                if [[ -n "${subcommand}" ]]; then
+                    idx=$((idx + 2))
+                else
+                    idx=$((idx + 1))
+                fi
+                ;;
+            -*)
+                idx=$((idx + 1))
+                ;;
+            *)
+                if [[ -z "${subcommand}" ]]; then
+                    subcommand="${arg}"
+                fi
+                idx=$((idx + 1))
+                ;;
+        esac
+    done
+fi
+
+# Handle subcommands that refuse, bypass, or clear the cached session key.
+if [[ "${subcommand}" == "serve" ]]; then
+    echo "Error: bw does not pass BW_SESSION to bw serve. Run bw.bin serve directly." >&2
+    exit 1
+fi
+
+if [[ "${has_help_or_version}" -eq 1 || "${has_explicit_session}" -eq 1 ]]; then
+    run_bw_bin "$@"
+fi
+
+case "${subcommand}" in
+    ""|help|login|unlock|status|config|encode|generate|completion|update)
+        run_bw_bin "$@"
+        ;;
     lock|logout)
         if KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" && [[ -n "$KEY_ID" ]]; then
             keyctl revoke "$KEY_ID" >/dev/null 2>&1 || true
             keyctl unlink "$KEY_ID" "$KEYRING" >/dev/null 2>&1 || true
         fi
         unset BW_SESSION
-        exec bw.bin "$@"
-        ;;
-    --help|-h|--version|-v|help|login|unlock|status|config)
-        exec bw.bin "$@"
-        ;;
-    serve)
-        echo "Error: bw does not inject BW_SESSION into bw serve. Run bw.bin serve directly." >&2
-        exit 1
+        run_bw_bin "$@"
         ;;
 esac
 
 refreshed=0
 if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z "$KEY_ID" ]]; then
-    if ! bw.sess; then
-        echo "Error: bw.sess failed." >&2
-        exit 1
-    fi
+    run_bw_sess
     refreshed=1
     if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z "$KEY_ID" ]]; then
         echo "Error: Keyring ${KEYRING} does not contain bw_session." >&2
@@ -55,16 +144,13 @@ if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z 
     fi
 fi
 
-# Refresh the timeout and read the key. Retry once via bw.sess if the key expired mid-flight.
+# Refresh the timeout and read the key. Retry once with bw.sess if the key expired.
 if [[ "$refreshed" -eq 0 ]]; then
     if keyctl timeout "$KEY_ID" "$TIMEOUT" 2>/dev/null && BW_SESSION="$(keyctl pipe "$KEY_ID" 2>/dev/null)" && [[ -n "$BW_SESSION" ]]; then
         export BW_SESSION
-        exec bw.bin "$@"
+        run_bw_bin "$@"
     fi
-    if ! bw.sess; then
-        echo "Error: bw.sess failed." >&2
-        exit 1
-    fi
+    run_bw_sess
     if ! KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" || [[ -z "$KEY_ID" ]]; then
         echo "Error: Keyring ${KEYRING} does not contain bw_session." >&2
         exit 1
@@ -73,7 +159,7 @@ fi
 
 # Reset the session key timeout on each use.
 if ! keyctl timeout "$KEY_ID" "$TIMEOUT"; then
-    echo "Error: keyctl failed to set the timeout." >&2
+    echo "Error: keyctl failed to set the session key timeout." >&2
     exit 1
 fi
 
@@ -84,9 +170,9 @@ if ! BW_SESSION="$(keyctl pipe "$KEY_ID")"; then
 fi
 
 if [[ -z "$BW_SESSION" ]]; then
-    echo "Error: Session key is empty." >&2
+    echo "Error: The session key is empty." >&2
     exit 1
 fi
 
 export BW_SESSION
-exec bw.bin "$@"
+run_bw_bin "$@"

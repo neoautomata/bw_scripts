@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+unset BW_SESSION
+
 if [[ $# -ne 0 ]]; then
     echo "Usage: ${0##*/}" >&2
     exit 1
@@ -28,30 +30,44 @@ if ! command -v bw.bin >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check whether the keyring holds an unlocked session key.
+# Isolate stdin so interactive prompts never read piped data.
+run_interactive_bw() {
+    if [[ -t 0 ]]; then
+        bw.bin "$@"
+    elif [[ -r /dev/tty ]] && ( : </dev/tty ) 2>/dev/null; then
+        bw.bin "$@" </dev/tty
+    else
+        bw.bin "$@" </dev/null
+    fi
+}
+
+# Check whether the keyring holds a valid unlocked session key.
 if KEY_ID="$(keyctl request user bw_session "$KEYRING" 2>/dev/null)" && [[ -n "$KEY_ID" ]]; then
     if existing_key="$(keyctl pipe "$KEY_ID" 2>/dev/null)" && [[ -n "$existing_key" ]]; then
-        if BW_SESSION="$existing_key" bw.bin unlock --check >/dev/null 2>&1; then
-            exit 0
+        if BW_SESSION="$existing_key" bw.bin unlock --check </dev/null >/dev/null 2>&1; then
+            if keyctl timeout "$KEY_ID" "$TIMEOUT" >/dev/null 2>&1; then
+                unset existing_key
+                exit 0
+            fi
         fi
     fi
+    unset existing_key
     # Revoke and unlink the stale key before re-authenticating.
     keyctl revoke "$KEY_ID" >/dev/null 2>&1 || true
     keyctl unlink "$KEY_ID" "$KEYRING" >/dev/null 2>&1 || true
 fi
 
-# Log in if no account session exists.
-if ! bw.bin login --check >/dev/null 2>&1; then
-    if ! bw.bin login >&2; then
+# Authenticate to Bitwarden and capture the raw session key.
+if ! bw.bin login --check </dev/null >/dev/null 2>&1; then
+    if ! key="$(run_interactive_bw login --raw)" || [[ -z "$key" ]]; then
         echo "Error: bw.bin login failed." >&2
         exit 1
     fi
-fi
-
-# Unlock the vault and capture the session key.
-if ! key="$(bw.bin unlock --raw)" || [[ -z "$key" ]]; then
-    echo "Error: bw.bin unlock failed." >&2
-    exit 2
+else
+    if ! key="$(run_interactive_bw unlock --raw)" || [[ -z "$key" ]]; then
+        echo "Error: bw.bin unlock failed." >&2
+        exit 2
+    fi
 fi
 
 KEY_ID=""
@@ -63,7 +79,10 @@ cleanup_new_key() {
         keyctl unlink "$KEY_ID" "$KEYRING" >/dev/null 2>&1 || true
     fi
 }
-trap cleanup_new_key EXIT INT TERM HUP
+trap cleanup_new_key EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # Store the session key in the configured keyring.
 if ! KEY_ID="$(printf '%s' "$key" | keyctl padd user bw_session "$KEYRING")" || [[ -z "$KEY_ID" ]]; then
@@ -72,20 +91,26 @@ if ! KEY_ID="$(printf '%s' "$key" | keyctl padd user bw_session "$KEYRING")" || 
     exit 1
 fi
 
-# Restrict key permissions to the possessor.
-if ! keyctl setperm "$KEY_ID" 0x3f000000; then
+# Grant possessor access on @s, and possessor plus owner UID access on @u.
+if [[ "$KEYRING" == "@s" ]]; then
+    KEY_PERM="0x3f000000"
+else
+    KEY_PERM="0x3f3f0000"
+fi
+
+if ! keyctl setperm "$KEY_ID" "$KEY_PERM"; then
     echo "Error: keyctl failed to set permissions on the session key." >&2
     exit 1
 fi
 
 # Set the session key timeout. The exit trap revokes the key if this fails.
 if ! keyctl timeout "$KEY_ID" "$TIMEOUT"; then
-    echo "Error: keyctl failed to set the timeout." >&2
+    echo "Error: keyctl failed to set the session key timeout." >&2
     exit 1
 fi
 timeout_set=1
 
-# Sync the vault if the last sync occurred more than 8 hours ago.
+# Sync the vault when the last sync occurred more than 8 hours ago.
 last_sync_raw="$(BW_SESSION="$key" bw.bin sync --last </dev/null 2>/dev/null || true)"
 if [[ -z "$last_sync_raw" || "$last_sync_raw" == "null" ]] || ! LAST_SYNC="$(date --date="$last_sync_raw" +%s 2>/dev/null)" || [[ -z "$LAST_SYNC" ]]; then
     LAST_SYNC=0

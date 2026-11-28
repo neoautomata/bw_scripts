@@ -2,6 +2,8 @@
 set -euo pipefail
 
 UUID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+ATT_ID_REGEX='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+JQ_ATT_ID_REGEX='\A[A-Za-z0-9][A-Za-z0-9._-]*\z'
 
 usage() {
     echo "Usage: ${0##*/} <itemID> (--exact <name> | --prefix <prefix> [--suffix <suffix> | --exclude-suffix <suffix>]) [--label <label>]" >&2
@@ -25,6 +27,7 @@ match_val=""
 suffix_mode="none"
 suffix_val=""
 label="Attachment"
+label_set=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -65,11 +68,12 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --label)
-            if [[ $# -lt 2 || -z "$2" ]]; then
+            if [[ "${label_set}" -ne 0 || $# -lt 2 || -z "$2" ]]; then
                 usage
                 exit 1
             fi
             label="$2"
+            label_set=1
             shift 2
             ;;
         *)
@@ -89,22 +93,35 @@ if [[ "${mode}" == "exact" && "${suffix_mode}" != "none" ]]; then
     exit 1
 fi
 
+if ! command -v bw.item.get >/dev/null 2>&1; then
+    echo "Error: bw.item.get is not in PATH." >&2
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is not in PATH." >&2
+    exit 1
+fi
+
 if ! itemJSON="$(bw.item.get "${itemID}")" || [[ -z "$itemJSON" ]]; then
     echo "Error: Bitwarden failed to read item ${itemID}." >&2
     exit 1
 fi
 
-# Match attachments using fixed filter logic and parameterized jq variables.
+# Check the item structure and match attachments using parameterized jq variables.
 # shellcheck disable=SC2016
-JQ_MATCH='[.attachments[]? | select(type == "object" and (.fileName? | type == "string")) | select(if $mode == "exact" then .fileName == $match else (.fileName | startswith($match)) and (if $suffix_mode == "include" then (.fileName | endswith($suffix)) elif $suffix_mode == "exclude" then (.fileName | endswith($suffix) | not) else true end) end)]'
+JQ_MATCH='if type != "object" then error("expected object")
+elif (.attachments | type) != "null" and (.attachments | type) != "array" then error("expected array or null attachments")
+else [(.attachments // [])[] | select(type == "object" and (.fileName? | type == "string")) | select(if $mode == "exact" then .fileName == $match else (.fileName | startswith($match)) and (if $suffix_mode == "include" then (.fileName | endswith($suffix)) elif $suffix_mode == "exclude" then (.fileName | endswith($suffix) | not) else true end) end)]
+end'
 
 if ! cnt="$(printf '%s' "${itemJSON}" | jq -r \
     --arg mode "${mode}" \
     --arg match "${match_val}" \
     --arg suffix_mode "${suffix_mode}" \
     --arg suffix "${suffix_val}" \
-    "${JQ_MATCH} | length")"; then
-    echo "Error: jq failed to query attachments for item ${itemID}." >&2
+    "(${JQ_MATCH}) | length")"; then
+    echo "Error: jq failed to parse item ${itemID}." >&2
     exit 1
 fi
 
@@ -119,16 +136,24 @@ if [[ "${cnt}" -eq 0 ]]; then
 fi
 
 if [[ "${cnt}" -gt 1 ]]; then
-    echo "Error: ${label} matched ${cnt} attachments. Expected 1." >&2
+    echo "Error: ${label} matched ${cnt} attachments. The script requires 1 match." >&2
     exit 3
 fi
 
-if ! printf '%s' "${itemJSON}" | jq -er \
+if ! att_id="$(printf '%s' "${itemJSON}" | jq -er \
     --arg mode "${mode}" \
     --arg match "${match_val}" \
     --arg suffix_mode "${suffix_mode}" \
     --arg suffix "${suffix_val}" \
-    "${JQ_MATCH}[0].id | strings | select(length > 0)"; then
-    echo "Error: Matched attachment has no valid ID." >&2
+    --arg id_re "${JQ_ATT_ID_REGEX}" \
+    "(${JQ_MATCH})[0].id | strings | select(test(\$id_re))")"; then
+    echo "Error: The matched attachment has no valid ID." >&2
     exit 1
 fi
+
+if [[ ! "${att_id}" =~ ${ATT_ID_REGEX} ]]; then
+    echo "Error: The matched attachment has no valid ID." >&2
+    exit 1
+fi
+
+printf '%s\n' "${att_id}"

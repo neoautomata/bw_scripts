@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+UUID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+JQ_UUID_REGEX='\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z'
+
 if [[ $# -ne 1 || -z "$1" ]]; then
     echo "Usage: ${0##*/} <search>" >&2
     exit 1
@@ -8,9 +11,27 @@ fi
 
 search="$1"
 
-if ! itemJSON="$(bw list items --search="${search}")" || [[ -z "$itemJSON" ]]; then
-    echo "Error: Bitwarden failed to search for ${search}." >&2
+if ! command -v bw >/dev/null 2>&1; then
+    echo "Error: bw is not in PATH." >&2
     exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is not in PATH." >&2
+    exit 1
+fi
+
+# List all items when search starts with optional whitespace and '>' so Lunr query syntax does not modify matching.
+if [[ "${search}" =~ ^[[:space:]]*\> ]]; then
+    if ! itemJSON="$(bw list items)" || [[ -z "$itemJSON" ]]; then
+        echo "Error: Bitwarden failed to list items for ${search}." >&2
+        exit 1
+    fi
+else
+    if ! itemJSON="$(bw list items --search="${search}")" || [[ -z "$itemJSON" ]]; then
+        echo "Error: Bitwarden failed to search for ${search}." >&2
+        exit 1
+    fi
 fi
 
 # Match only active items whose name equals the exact search string.
@@ -33,11 +54,21 @@ if [[ "${cnt}" -eq 0 ]]; then
 fi
 
 if [[ "${cnt}" -gt 1 ]]; then
-    echo "Error: Search found ${cnt} items for ${search}. Expected 1." >&2
+    echo "Error: Search found ${cnt} items for ${search}. The script requires 1 match." >&2
     exit 3
 fi
 
-if ! printf '%s' "${itemJSON}" | jq -er --arg search "${search}" "(${JQ_MATCH}) | .[0].id | strings | select(length > 0)"; then
-    echo "Error: Matched item has no valid ID." >&2
+if ! matched_id="$(printf '%s' "${itemJSON}" | jq -er \
+    --arg search "${search}" \
+    --arg uuid_re "${JQ_UUID_REGEX}" \
+    "(${JQ_MATCH}) | .[0].id | strings | select(test(\$uuid_re))")"; then
+    echo "Error: The matched item has no valid ID." >&2
     exit 1
 fi
+
+if [[ ! "${matched_id}" =~ ${UUID_REGEX} ]]; then
+    echo "Error: The matched item has no valid ID." >&2
+    exit 1
+fi
+
+printf '%s\n' "${matched_id}"

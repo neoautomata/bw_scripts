@@ -16,4 +16,9 @@ if [[ ! "${itemID}" =~ ${UUID_REGEX} ]]; then
     exit 1
 fi
 
+if ! command -v bw.item.attachmentID >/dev/null 2>&1; then
+    echo "Error: bw.item.attachmentID is not in PATH." >&2
+    exit 1
+fi
+
 exec bw.item.attachmentID "${itemID}" --prefix "${query}" --exclude-suffix ".pub" --label "Private key"

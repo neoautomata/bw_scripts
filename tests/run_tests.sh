@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(CDPATH="" cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 RUN_SHELLCHECK=1
 
@@ -38,9 +38,9 @@ done
 
 # Discover test suites in deterministic C locale sort order.
 suites=()
-while IFS= read -r suite; do
+while IFS= read -r -d '' suite; do
     [[ -n "$suite" ]] && suites+=("$suite")
-done < <(LC_ALL=C find "${SCRIPT_DIR}" -maxdepth 1 -type f -name 'test_*.sh' | LC_ALL=C sort)
+done < <(LC_ALL=C find "${SCRIPT_DIR}" -maxdepth 1 -type f -name 'test_*.sh' -print0 | LC_ALL=C sort -z)
 
 if [[ "${#suites[@]}" -eq 0 ]]; then
     echo "Error: Found 0 test suites in ${SCRIPT_DIR}." >&2
@@ -51,7 +51,7 @@ passed_suites=0
 failed_suites=0
 failed_names=()
 
-echo "Running ${#suites[@]} test suite(s)..."
+echo "Running ${#suites[@]} test suite(s)."
 echo
 
 for suite in "${suites[@]}"; do
@@ -95,7 +95,7 @@ if [[ "${RUN_SHELLCHECK}" -eq 1 ]]; then
         done
 
         if shellcheck "${sc_targets[@]}"; then
-            echo "SHELLCHECK PASS: checked ${#sc_targets[@]} file(s)."
+            echo "SHELLCHECK PASS: Checked ${#sc_targets[@]} file(s)."
             shellcheck_status="passed"
         else
             echo "SHELLCHECK FAIL: shellcheck reported issues." >&2
@@ -110,7 +110,7 @@ if [[ "${RUN_SHELLCHECK}" -eq 1 ]]; then
 fi
 
 total_suites=$((passed_suites + failed_suites))
-echo "Summary: ${passed_suites}/${total_suites} test suite(s) passed, ${failed_suites} failed (shellcheck: ${shellcheck_status})."
+echo "Summary: ${passed_suites} of ${total_suites} test suite(s) passed. Failed: ${failed_suites}. Shellcheck: ${shellcheck_status}."
 
 if [[ "${failed_suites}" -gt 0 ]]; then
     echo "Failed suites: ${failed_names[*]}" >&2

@@ -14,4 +14,48 @@ if [[ ! "${itemID}" =~ ${UUID_REGEX} ]]; then
     exit 1
 fi
 
-exec bw get password -- "${itemID}"
+if ! command -v bw.item.get >/dev/null 2>&1; then
+    echo "Error: bw.item.get is not in PATH." >&2
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is not in PATH." >&2
+    exit 1
+fi
+
+if ! itemJSON="$(bw.item.get "${itemID}")" || [[ -z "$itemJSON" ]]; then
+    echo "Error: Bitwarden failed to read item ${itemID}." >&2
+    exit 1
+fi
+
+# Check the item structure and classify the password state.
+JQ_STATE='if type != "object" then error("expected object")
+elif (.login | type) != "null" and (.login | type) != "object" then error("expected object or null login")
+elif .login == null or .login.password == null then "missing"
+elif (.login.password | type) != "string" then error("expected string password")
+elif (.login.password | length) == 0 then "empty"
+else "present"
+end'
+
+if ! state="$(printf '%s' "${itemJSON}" | jq -r "${JQ_STATE}")"; then
+    echo "Error: jq failed to parse item ${itemID}." >&2
+    exit 1
+fi
+
+case "${state}" in
+    present)
+        if ! printf '%s' "${itemJSON}" | jq -r '.login.password'; then
+            echo "Error: jq failed to read the password for item ${itemID}." >&2
+            exit 1
+        fi
+        ;;
+    missing|empty)
+        echo "Error: Item ${itemID} has no password." >&2
+        exit 2
+        ;;
+    *)
+        echo "Error: jq returned an unexpected password state." >&2
+        exit 1
+        ;;
+esac
